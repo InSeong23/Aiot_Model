@@ -1,0 +1,148 @@
+{
+  "influxdb": {
+    "url": "https://influxdb.javame.live",
+    "token": "g-W7W0j9AE4coriQfnhHGMDnDhTZGok8bgY1NnZ6Z0EnTOsFY3SWAqDTC5fYlQ9mYnbK_doR074-a4Dgck2AOQ==",
+    "org": "javame",
+    "bucket": "data",
+    "origins": [
+      "server_data",
+      "sensor_data"
+    ],
+    "locations": [
+      "cpu",
+      "disk",
+      "diskio",
+      "mem",
+      "net",
+      "sensors",
+      "system"
+    ]
+  },
+  "mysql": {
+    "host": "s4.java21.net",
+    "port": 13306,
+    "user": "aiot02_team3",
+    "password": "ryL7LcSp@Yiz[bR7",
+    "database": "aiot02_team3"
+  },
+  "prediction": {
+    "failure": {
+      "enabled": true,
+      "interval_hours": 6,
+      "threshold": 10.0,
+      "input_window": 24,
+      "target_column": "usage_idle"
+    },
+    "resource": {
+      "enabled": true,
+      "interval_hours": 12,
+      "capacity_threshold": 85,
+      "input_window": 48,
+      "pred_horizon": 24,
+      "target_column": "used_percent"
+    },
+    "retraining_days": 7,
+    "visualization": false
+  },
+  "resources": {
+    "cpu": {
+      "target_columns": [
+        "usage_user",
+        "usage_system",
+        "usage_idle"
+      ],
+      "prediction_type": [
+        "failure",
+        "resource"
+      ]
+    },
+    "mem": {
+      "target_columns": [
+        "used_percent",
+        "available_percent"
+      ],
+      "prediction_type": [
+        "failure",
+        "resource"
+      ]
+    },
+    "disk": {
+      "target_columns": [
+        "used_percent"
+      ],
+      "prediction_type": [
+        "failure",
+        "resource"
+      ]
+    },
+    "diskio": {
+      "target_columns": [
+        "io_time",
+        "read_bytes",
+        "write_bytes"
+      ],
+      "prediction_type": [
+        "resource"
+      ]
+    },
+    "net": {
+      "target_columns": [
+        "bytes_recv",
+        "bytes_sent",
+        "drop_in",
+        "drop_out",
+        "err_in",
+        "err_out"
+      ],
+      "prediction_type": [
+        "resource"
+      ]
+    },
+    "system": {
+      "target_columns": [
+        "load1",
+        "load5",
+        "load15"
+      ],
+      "prediction_type": [
+        "failure"
+      ]
+    }
+  },
+  "resources_limits": {
+    "network": {
+      "max_bandwidth": 125000000
+    },
+    "disk": {
+      "max_io_rate": 100000000
+    }
+  },
+  "api": {
+    "url": "http://localhost:10272/ai/data"
+  },
+  "data_processing": {
+    "default_values": {
+      "device_id": "device_001",
+      "companyDomain": "javame",
+      "building": "gyeongnam_campus",
+      "resource_type": "value"
+    }
+  },
+  "advanced": {
+    "resampling": {
+      "enabled": true,
+      "freq": "5min"
+    },
+    "missing_data": {
+      "handle_missing": true,
+      "max_missing_ratio": 0.5
+    },
+    "outliers": {
+      "handle_outliers": true,
+      "method": "zscore",
+      "threshold": 3.0
+    },
+    "save_csv": false,
+    "log_level": "INFO"
+  }
+}
