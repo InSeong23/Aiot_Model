@@ -283,35 +283,36 @@ def init_components():
     return collector, preprocessor, predictor, result_handler
 
 def run_data_collection():
-    """
-    데이터 수집 및 전처리 작업 실행
-    
-    Returns:
-        bool: 성공 여부
-    """
+    """데이터 수집 및 전처리 작업 실행"""
     logger.info("===== 데이터 수집 및 전처리 작업 시작 =====")
     
     # 실행 시작 시간
     start_time = datetime.now()
     
     try:
-        # 최근 7일간의 데이터 수집 및 전처리
-        processed_data = collector.collect_all_resources(days=7)
+        # 증분 수집: 마지막 수집 시간 이후의 데이터만 수집
+        # 자동으로 각 디바이스 및 자원별 마지막 수집 시간을 사용함
+        processed_data = collector.collect_all_resources(save_to_mysql=True)
         
         if processed_data:
-            resources_count = len(processed_data)
-            logger.info(f"데이터 수집 및 전처리 완료: {resources_count}개 자원")
+            company_count = len(processed_data)
+            logger.info(f"데이터 수집 및 전처리 완료: {company_count}개 회사/디바이스")
             
-            # 각 자원별 데이터 행 수 로깅
-            for resource_type, df in processed_data.items():
-                logger.info(f"- {resource_type}: {len(df)}행")
+            # 각 회사/디바이스별 데이터 로깅
+            for key, data in processed_data.items():
+                resource_count = len(data)
+                logger.info(f"- {key}: {resource_count}개 자원")
+                
+                # 각 자원별 데이터 행 수 로깅
+                for resource_type, df in data.items():
+                    logger.info(f"  - {resource_type}: {len(df)}행")
             
             logger.info("===== 데이터 수집 및 전처리 작업 완료 =====")
             return True
         else:
-            logger.error("데이터 수집 및 전처리 실패")
-            logger.info("===== 데이터 수집 및 전처리 작업 실패 =====")
-            return False
+            logger.warning("데이터 수집 및 전처리 결과가 없습니다.")
+            logger.info("===== 데이터 수집 및 전처리 작업 완료 =====")
+            return True
     
     except Exception as e:
         logger.error(f"데이터 수집 중 오류 발생: {e}")

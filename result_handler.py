@@ -58,149 +58,169 @@ class ResultHandler:
             
             cursor = conn.cursor()
             
-            # 전처리된 데이터 저장 테이블
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS processed_resource_data (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                timestamp DATETIME,               -- 측정 시간
-                device_id VARCHAR(50),            -- 장치 ID
-                companyDomain VARCHAR(100),       -- 회사 도메인
-                building VARCHAR(100),            -- 건물
-                
-                -- CPU 지표
-                cpu_usage FLOAT,                  -- CPU 사용률 (100 - usage_idle)
-                cpu_user_system_ratio FLOAT,      -- 사용자/시스템 CPU 사용 비율
-                
-                -- 메모리 지표
-                memory_used_percent FLOAT,        -- 메모리 사용률
-                
-                -- 디스크 지표 
-                disk_used_percent FLOAT,          -- 디스크 사용률
-                
-                -- 디스크 I/O 지표
-                disk_read_rate FLOAT,             -- 디스크 읽기 속도 (bytes/sec)
-                disk_write_rate FLOAT,            -- 디스크 쓰기 속도 (bytes/sec)
-                disk_io_utilization FLOAT,        -- 디스크 I/O 사용률 (%)
-                
-                -- 네트워크 지표
-                net_throughput_sent FLOAT,        -- 네트워크 송신 처리량 (bytes/sec)
-                net_throughput_recv FLOAT,        -- 네트워크 수신 처리량 (bytes/sec)
-                net_drop_rate_in FLOAT,           -- 수신 패킷 손실률
-                net_drop_rate_out FLOAT,          -- 송신 패킷 손실률
-                net_error_rate_in FLOAT,          -- 수신 에러율 (errors/sec)
-                net_error_rate_out FLOAT,         -- 송신 에러율 (errors/sec)
-                net_utilization FLOAT,            -- 네트워크 사용률 (%)
-                
-                -- 시스템 부하 지표
-                system_load1 FLOAT,               -- 1분 평균 시스템 로드
-                
-                -- 인덱스
-                INDEX idx_timestamp (timestamp),
-                INDEX idx_device (device_id)
-            )
-            """)
+            # EAV 모델 기반 테이블 구조 사용 여부 확인
+            use_eav_model = self.config.get("database", {}).get("use_eav_model", False)
             
-            # 자원 사용량 예측 테이블 (수정)
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS resource_predictions (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                timestamp DATETIME,               -- 예측 시점
-                device_id VARCHAR(50),            -- 장치 ID
-                companyDomain VARCHAR(100),       -- 회사 도메인
-                building VARCHAR(100),            -- 건물
+            if use_eav_model:
+                # 자원 메트릭 테이블
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS resource_metrics (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    timestamp DATETIME NOT NULL,
+                    device_id VARCHAR(50) NOT NULL,
+                    resource_type VARCHAR(50),
+                    metric_name VARCHAR(50),
+                    metric_value FLOAT,
+                    unit VARCHAR(10),
+                    companyDomain VARCHAR(100),
+                    building VARCHAR(100),
+                    
+                    INDEX idx_device_time (device_id, timestamp),
+                    INDEX idx_metric (resource_type, metric_name)
+                )
+                """)
                 
-                -- 각 자원별 예측값
-                cpu_usage_predicted FLOAT,        -- 예측된 CPU 사용률
-                memory_used_percent_predicted FLOAT, -- 예측된 메모리 사용률
-                disk_used_percent_predicted FLOAT, -- 예측된 디스크 사용률
-                disk_io_utilization_predicted FLOAT, -- 예측된 디스크 I/O 사용률
-                net_utilization_predicted FLOAT,  -- 예측된 네트워크 사용률
-                system_load1_predicted FLOAT,     -- 예측된 시스템 로드
+                # 예측 결과 테이블
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS prediction_results (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    timestamp DATETIME NOT NULL,
+                    device_id VARCHAR(50) NOT NULL, 
+                    resource_type VARCHAR(50),
+                    metric_name VARCHAR(50),
+                    predicted_value FLOAT,
+                    prediction_type VARCHAR(20),
+                    prediction_horizon VARCHAR(20),
+                    prediction_time DATETIME,
+                    companyDomain VARCHAR(100),
+                    building VARCHAR(100),
+                    
+                    INDEX idx_device_time (device_id, timestamp),
+                    INDEX idx_metric (resource_type, metric_name),
+                    INDEX idx_prediction (prediction_time, prediction_type)
+                )
+                """)
+            else:
+                # 전처리된 데이터 저장 테이블 (기존 구조)
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS processed_resource_data (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    timestamp DATETIME,               -- 측정 시간
+                    device_id VARCHAR(50),            -- 장치 ID
+                    companyDomain VARCHAR(100),       -- 회사 도메인
+                    building VARCHAR(100),            -- 건물
+                    
+                    -- CPU 지표
+                    cpu_usage FLOAT,                  -- CPU 사용률 (100 - usage_idle)
+                    cpu_user_system_ratio FLOAT,      -- 사용자/시스템 CPU 사용 비율
+                    
+                    -- 메모리 지표
+                    memory_used_percent FLOAT,        -- 메모리 사용률
+                    
+                    -- 디스크 지표 
+                    disk_used_percent FLOAT,          -- 디스크 사용률
+                    
+                    -- 디스크 I/O 지표
+                    disk_read_rate FLOAT,             -- 디스크 읽기 속도 (bytes/sec)
+                    disk_write_rate FLOAT,            -- 디스크 쓰기 속도 (bytes/sec)
+                    disk_io_utilization FLOAT,        -- 디스크 I/O 사용률 (%)
+                    
+                    -- 네트워크 지표
+                    net_throughput_sent FLOAT,        -- 네트워크 송신 처리량 (bytes/sec)
+                    net_throughput_recv FLOAT,        -- 네트워크 수신 처리량 (bytes/sec)
+                    net_drop_rate_in FLOAT,           -- 수신 패킷 손실률
+                    net_drop_rate_out FLOAT,          -- 송신 패킷 손실률
+                    net_error_rate_in FLOAT,          -- 수신 에러율 (errors/sec)
+                    net_error_rate_out FLOAT,         -- 송신 에러율 (errors/sec)
+                    net_utilization FLOAT,            -- 네트워크 사용률 (%)
+                    
+                    -- 시스템 부하 지표
+                    system_load1 FLOAT,               -- 1분 평균 시스템 로드
+                    
+                    -- 인덱스
+                    INDEX idx_timestamp (timestamp),
+                    INDEX idx_device (device_id)
+                )
+                """)
                 
-                prediction_time DATETIME,         -- 예측이 수행된 시간
-                prediction_horizon VARCHAR(20),   -- 예측 기간 (short_term, mid_term, long_term)
+                # 자원 사용량 예측 테이블 (기존 구조)
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS resource_predictions (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    timestamp DATETIME,               -- 예측 시점
+                    device_id VARCHAR(50),            -- 장치 ID
+                    companyDomain VARCHAR(100),       -- 회사 도메인
+                    building VARCHAR(100),            -- 건물
+                    
+                    -- 각 자원별 예측값
+                    cpu_usage_predicted FLOAT,        -- 예측된 CPU 사용률
+                    memory_used_percent_predicted FLOAT, -- 예측된 메모리 사용률
+                    disk_used_percent_predicted FLOAT, -- 예측된 디스크 사용률
+                    disk_io_utilization_predicted FLOAT, -- 예측된 디스크 I/O 사용률
+                    net_utilization_predicted FLOAT,  -- 예측된 네트워크 사용률
+                    system_load1_predicted FLOAT,     -- 예측된 시스템 로드
+                    
+                    prediction_time DATETIME,         -- 예측이 수행된 시간
+                    prediction_horizon VARCHAR(20),   -- 예측 기간 (short_term, mid_term, long_term)
+                    
+                    -- 인덱스
+                    INDEX idx_timestamp (timestamp),
+                    INDEX idx_device (device_id),
+                    INDEX idx_prediction (prediction_time, prediction_horizon)
+                )
+                """)
                 
-                -- 인덱스
-                INDEX idx_timestamp (timestamp),
-                INDEX idx_device (device_id),
-                INDEX idx_prediction (prediction_time, prediction_horizon)
-            )
-            """)
+                # 고장 예측 테이블 (기존 구조)
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS failure_predictions (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    timestamp DATETIME,               -- 예측 시점
+                    device_id VARCHAR(50),            -- 장치 ID
+                    companyDomain VARCHAR(100),       -- 회사 도메인
+                    building VARCHAR(100),            -- 건물
+                    
+                    -- 각 자원별 고장 확률
+                    cpu_failure_probability FLOAT,    -- CPU 고장 확률
+                    memory_failure_probability FLOAT, -- 메모리 고장 확률
+                    disk_failure_probability FLOAT,   -- 디스크 고장 확률
+                    network_failure_probability FLOAT, -- 네트워크 고장 확률
+                    system_failure_probability FLOAT, -- 시스템 고장 확률
+                    
+                    -- 고장 예측 여부 (임계값 초과 시 TRUE)
+                    is_failure_predicted BOOLEAN,     -- 종합 고장 예측 여부
+                    failure_resource VARCHAR(50),     -- 고장 예측된 주요 자원
+                    
+                    prediction_time DATETIME,         -- 예측이 수행된 시간
+                    
+                    -- 인덱스
+                    INDEX idx_timestamp (timestamp),
+                    INDEX idx_device (device_id),
+                    INDEX idx_failure (is_failure_predicted)
+                )
+                """)
             
-            # 고장 예측 테이블 (수정)
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS failure_predictions (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                timestamp DATETIME,               -- 예측 시점
-                device_id VARCHAR(50),            -- 장치 ID
-                companyDomain VARCHAR(100),       -- 회사 도메인
-                building VARCHAR(100),            -- 건물
-                
-                -- 각 자원별 고장 확률
-                cpu_failure_probability FLOAT,    -- CPU 고장 확률
-                memory_failure_probability FLOAT, -- 메모리 고장 확률
-                disk_failure_probability FLOAT,   -- 디스크 고장 확률
-                network_failure_probability FLOAT, -- 네트워크 고장 확률
-                system_failure_probability FLOAT, -- 시스템 고장 확률
-                
-                -- 고장 예측 여부 (임계값 초과 시 TRUE)
-                is_failure_predicted BOOLEAN,     -- 종합 고장 예측 여부
-                failure_resource VARCHAR(50),     -- 고장 예측된 주요 자원
-                
-                prediction_time DATETIME,         -- 예측이 수행된 시간
-                
-                -- 인덱스
-                INDEX idx_timestamp (timestamp),
-                INDEX idx_device (device_id),
-                INDEX idx_failure (is_failure_predicted)
-            )
-            """)
-            
-            # 용량 계획 테이블 (수정)
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS capacity_planning (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                resource_type VARCHAR(50),        -- 자원 유형 (cpu, memory, disk, network)
-                scenario VARCHAR(50),             -- 시나리오 (기본, 저성장, 고성장 등)
-                companyDomain VARCHAR(100),       -- 회사 도메인
-                building VARCHAR(100),            -- 건물
-                device_id VARCHAR(50),            -- 장치 ID (여러 장치 관리 시)
-                expansion_date DATE,              -- 증설 필요 예상 일자
-                threshold_value FLOAT,            -- 임계값
-                prediction_time DATETIME,         -- 예측이 수행된 시간
-                
-                -- 인덱스
-                INDEX idx_resource (resource_type),
-                INDEX idx_expansion (expansion_date)
-            )
-            """)
-            
-            # 모델 성능 평가 테이블 (신규)
+            # 모델 성능 테이블 (공통)
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS model_performance (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 model_type VARCHAR(50),           -- 모델 유형 (resource_prediction, failure_prediction)
                 resource_type VARCHAR(50),        -- 자원 유형 (cpu, memory, disk, network, system)
                 evaluation_time DATETIME,         -- 평가 시간
-                
-                -- 성능 지표
                 rmse FLOAT,                       -- Root Mean Squared Error
                 mae FLOAT,                        -- Mean Absolute Error
                 accuracy FLOAT,                   -- 정확도 (분류 모델)
                 precision_score FLOAT,            -- 정밀도 (분류 모델)
                 recall_score FLOAT,               -- 재현율 (분류 모델)
                 f1_score FLOAT,                   -- F1 점수 (분류 모델)
-                
                 sample_count INT,                 -- 평가에 사용된 샘플 수
                 model_version VARCHAR(50),        -- 모델 버전
                 
-                -- 인덱스
                 INDEX idx_evaluation (evaluation_time),
                 INDEX idx_model (model_type, resource_type)
             )
             """)
             
-            # 예측 실행 정보 테이블 (유지)
+            # 예측 실행 기록 (공통)
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS prediction_runs (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -208,14 +228,28 @@ class ResultHandler:
                 run_end_time DATETIME,            -- 예측 실행 종료 시간
                 prediction_type VARCHAR(50),      -- 예측 유형 (resource, failure)
                 status VARCHAR(20),               -- 상태 (success, failed, partial)
-                locations_processed VARCHAR(255), -- 처리된 위치 목록 (쉼표로 구분)
-                error_message TEXT,               -- 오류 메시지 (있는 경우)
+                locations_processed VARCHAR(255), -- 처리된 위치 목록
+                error_message TEXT,               -- 오류 메시지
                 resource_count INT,               -- 처리된 자원 수
-                model_version VARCHAR(50),        -- 사용된 모델 버전
+                model_version VARCHAR(50),        -- 모델 버전
                 
-                -- 인덱스
                 INDEX idx_run_time (run_start_time),
                 INDEX idx_status (status)
+            )
+            """)
+            
+            # 마지막 데이터 수집 시간 관리 테이블 (새로 추가)
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS collection_metadata (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                collection_type VARCHAR(50),       -- 수집 유형 (resource, failure, etc)
+                device_id VARCHAR(50),             -- 장치 ID
+                companyDomain VARCHAR(100),        -- 회사 도메인
+                building VARCHAR(100),             -- 건물
+                last_collection_time DATETIME,     -- 마지막 수집 시간
+                
+                INDEX idx_device (device_id, companyDomain, building),
+                INDEX idx_type (collection_type)
             )
             """)
             
@@ -246,7 +280,113 @@ class ResultHandler:
             logger.warning("저장할 전처리 데이터가 비어 있습니다.")
             return False
         
-        return self.save_to_mysql(df, "processed_resource_data")
+        # EAV 모델 사용 여부 확인
+        use_eav_model = self.config.get("database", {}).get("use_eav_model", False)
+        
+        if use_eav_model:
+            # 자원 유형 확인
+            resource_type = df['location'].iloc[0] if 'location' in df.columns else None
+            if not resource_type:
+                logger.warning("자원 유형을 확인할 수 없습니다.")
+                return False
+            
+            # EAV 모델로 변환하여 저장
+            return self.save_resource_metrics(df, resource_type)
+        else:
+            # 기존 방식으로 저장
+            return self.save_to_mysql(df, "processed_resource_data")
+    
+    def save_resource_metrics(self, df, resource_type):
+        """
+        자원 메트릭을 EAV 모델 형식으로 MySQL에 저장
+        
+        Args:
+            df (pd.DataFrame): 자원 데이터프레임
+            resource_type (str): 자원 유형 (cpu, mem, disk, diskio, net, system)
+            
+        Returns:
+            bool: 성공 여부
+        """
+        if df is None or df.empty:
+            logger.warning("저장할 자원 메트릭 데이터가 비어 있습니다.")
+            return False
+        
+        # 기본 메타데이터 추출
+        device_id = df['device_id'].iloc[0] if 'device_id' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('device_id', 'device_001')
+        company_domain = df['companyDomain'].iloc[0] if 'companyDomain' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('companyDomain', 'javame')
+        building = df['building'].iloc[0] if 'building' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('building', 'gyeongnam_campus')
+        
+        try:
+            conn = mysql.connector.connect(
+                host=self.mysql_config.get('host'),
+                port=self.mysql_config.get('port'),
+                user=self.mysql_config.get('user'),
+                password=self.mysql_config.get('password'),
+                database=self.mysql_config.get('database')
+            )
+            
+            cursor = conn.cursor()
+            
+            # 데이터 변환 및 삽입
+            records = []
+            
+            # 인덱스가 DatetimeIndex인 경우 열로 변환
+            if isinstance(df.index, pd.DatetimeIndex):
+                df = df.reset_index().rename(columns={'index': 'timestamp'})
+            
+            # 각 지표별로 EAV 형식으로 변환
+            for idx, row in df.iterrows():
+                timestamp = row['timestamp'] if 'timestamp' in df.columns else datetime.now()
+                
+                # 숫자형 열만 사용
+                for col in df.select_dtypes(include=[np.number]).columns:
+                    # 메타데이터 열은 건너뜀
+                    if col in ['id', 'device_id', 'companyDomain', 'building'] or 'timestamp' in col.lower():
+                        continue
+                    
+                    # 단위 결정
+                    unit = '%' if 'percent' in col or 'usage' in col else ''
+                    if 'bytes' in col:
+                        unit = 'bytes/s'
+                    elif 'rate' in col:
+                        unit = '/s'
+                    
+                    # 레코드 추가
+                    records.append((
+                        timestamp,
+                        device_id,
+                        resource_type,
+                        col,
+                        float(row[col]),
+                        unit,
+                        company_domain,
+                        building
+                    ))
+            
+            # 일괄 삽입
+            query = """
+            INSERT INTO resource_metrics 
+            (timestamp, device_id, resource_type, metric_name, metric_value, unit, companyDomain, building)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            
+            cursor.executemany(query, records)
+            conn.commit()
+            
+            logger.info(f"{len(records)}개의 자원 메트릭이 저장되었습니다. (자원: {resource_type})")
+            
+            # 마지막 수집 시간 업데이트
+            self.update_last_collection_time(resource_type, device_id, company_domain, building)
+            
+            cursor.close()
+            conn.close()
+            return True
+            
+        except Exception as e:
+            logger.error(f"자원 메트릭 저장 실패: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
     
     def save_to_mysql(self, df, table_name):
         """
@@ -422,6 +562,96 @@ class ResultHandler:
             logger.error(traceback.format_exc())
             return pd.DataFrame()
     
+    def load_resource_metrics(self, resource_type, device_id=None, start_time=None, end_time=None, metrics=None):
+        """
+        EAV 모델에서 자원 메트릭 로드
+        
+        Args:
+            resource_type (str): 자원 유형 (cpu, mem, disk, diskio, net, system)
+            device_id (str): 장치 ID
+            start_time (datetime): 시작 시간
+            end_time (datetime): 종료 시간
+            metrics (list): 지표 이름 목록
+            
+        Returns:
+            pd.DataFrame: 로드된 자원 메트릭 데이터프레임
+        """
+        try:
+            conn = mysql.connector.connect(
+                host=self.mysql_config.get('host'),
+                port=self.mysql_config.get('port'),
+                user=self.mysql_config.get('user'),
+                password=self.mysql_config.get('password'),
+                database=self.mysql_config.get('database')
+            )
+            
+            # 기본 쿼리
+            query = "SELECT * FROM resource_metrics"
+            conditions = []
+            
+            # 필터 조건 추가
+            if resource_type:
+                conditions.append(f"resource_type = '{resource_type}'")
+            
+            if device_id:
+                conditions.append(f"device_id = '{device_id}'")
+            
+            if metrics and len(metrics) > 0:
+                metrics_cond = " OR ".join([f"metric_name = '{m}'" for m in metrics])
+                conditions.append(f"({metrics_cond})")
+            
+            # 시간 필터
+            if start_time:
+                conditions.append(f"timestamp >= '{start_time.strftime('%Y-%m-%d %H:%M:%S')}'")
+            if end_time:
+                conditions.append(f"timestamp <= '{end_time.strftime('%Y-%m-%d %H:%M:%S')}'")
+            
+            # 조건 적용
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+            
+            # 시간순 정렬
+            query += " ORDER BY timestamp"
+            
+            # 쿼리 실행
+            raw_df = pd.read_sql_query(query, conn, parse_dates=['timestamp'])
+            
+            conn.close()
+            
+            if raw_df.empty:
+                return pd.DataFrame()
+            
+            # EAV 형식을 피벗하여 일반 시계열 형식으로 변환
+            df_pivot = raw_df.pivot_table(
+                index=['timestamp', 'device_id', 'companyDomain', 'building'],
+                columns='metric_name',
+                values='metric_value',
+                aggfunc='first'
+            ).reset_index()
+            
+            # timestamp를 인덱스로 설정
+            df_pivot.set_index('timestamp', inplace=True)
+            
+            # 메타데이터 열 추가
+            if 'device_id' in df_pivot.columns:
+                df_pivot['device_id'] = raw_df['device_id'].iloc[0]
+            if 'companyDomain' in df_pivot.columns:
+                df_pivot['companyDomain'] = raw_df['companyDomain'].iloc[0]
+            if 'building' in df_pivot.columns:
+                df_pivot['building'] = raw_df['building'].iloc[0]
+            
+            # 자원 유형 열 추가
+            df_pivot['resource_type'] = resource_type
+            
+            logger.info(f"{len(df_pivot)}개의 자원 메트릭을 로드했습니다. (자원: {resource_type})")
+            return df_pivot
+            
+        except Exception as e:
+            logger.error(f"자원 메트릭 로드 실패: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return pd.DataFrame()
+    
     def send_to_api(self, data, endpoint_suffix):
         """
         데이터를 API로 전송
@@ -525,13 +755,134 @@ class ResultHandler:
         # 예측 지평선 추가
         predictions_df['prediction_horizon'] = horizon
         
-        # 1. MySQL에 저장
-        mysql_success = self.save_to_mysql(predictions_df, "resource_predictions")
+        # EAV 모델 사용 여부 확인
+        use_eav_model = self.config.get("database", {}).get("use_eav_model", False)
         
-        # 2. API로 전송
+        if use_eav_model:
+            # 자원 유형 확인
+            resource_type = None
+            
+            # 컬럼명에서 자원 유형 추출
+            for col in predictions_df.columns:
+                if 'cpu' in col.lower() and '_pred' in col.lower():
+                    resource_type = 'cpu'
+                    break
+                elif 'mem' in col.lower() and '_pred' in col.lower():
+                    resource_type = 'mem'
+                    break
+                elif 'disk' in col.lower() and '_pred' in col.lower():
+                    resource_type = 'disk'
+                    break
+                elif 'net' in col.lower() and '_pred' in col.lower():
+                    resource_type = 'net'
+                    break
+                elif 'system' in col.lower() and '_pred' in col.lower():
+                    resource_type = 'system'
+                    break
+            
+            if not resource_type:
+                logger.warning("자원 유형을 확인할 수 없습니다.")
+                resource_type = "unknown"
+            
+            # EAV 모델로 변환하여 저장
+            return self.save_prediction_results(predictions_df, "resource", resource_type, horizon)
+        else:
+            # 기존 방식으로 저장
+            mysql_success = self.save_to_mysql(predictions_df, "resource_predictions")
+        
+        # API로 전송
         api_success = self.send_to_api(predictions_df, "resource_predictions")
         
         return mysql_success and api_success
+    
+    def save_prediction_results(self, df, prediction_type, resource_type, prediction_horizon='short_term'):
+        """
+        예측 결과를 EAV 모델 형식으로 MySQL에 저장
+        
+        Args:
+            df (pd.DataFrame): 예측 결과 데이터프레임
+            prediction_type (str): 예측 유형 (resource, failure)
+            resource_type (str): 자원 유형 (cpu, mem, disk, diskio, net, system)
+            prediction_horizon (str): 예측 지평선 (short_term, mid_term, long_term)
+            
+        Returns:
+            bool: 성공 여부
+        """
+        if df is None or df.empty:
+            logger.warning("저장할 예측 결과가 비어 있습니다.")
+            return False
+        
+        # 기본 메타데이터 추출
+        device_id = df['device_id'].iloc[0] if 'device_id' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('device_id', 'device_001')
+        company_domain = df['companyDomain'].iloc[0] if 'companyDomain' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('companyDomain', 'javame')
+        building = df['building'].iloc[0] if 'building' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('building', 'gyeongnam_campus')
+        prediction_time = df['prediction_time'].iloc[0] if 'prediction_time' in df.columns else datetime.now()
+        
+        try:
+            conn = mysql.connector.connect(
+                host=self.mysql_config.get('host'),
+                port=self.mysql_config.get('port'),
+                user=self.mysql_config.get('user'),
+                password=self.mysql_config.get('password'),
+                database=self.mysql_config.get('database')
+            )
+            
+            cursor = conn.cursor()
+            
+            # 데이터 변환 및 삽입
+            records = []
+            
+            # 인덱스가 DatetimeIndex인 경우 열로 변환
+            if isinstance(df.index, pd.DatetimeIndex):
+                df = df.reset_index().rename(columns={'index': 'timestamp'})
+            
+            # 각 예측 결과를 EAV 형식으로 변환
+            for idx, row in df.iterrows():
+                timestamp = row['timestamp'] if 'timestamp' in df.columns else datetime.now()
+                
+                # 예측값을 포함하는 열 찾기
+                pred_cols = [col for col in df.columns if 'predict' in col or 'probability' in col]
+                
+                for col in pred_cols:
+                    # 메트릭 이름 추출
+                    metric_name = col.replace('_predicted', '').replace('_probability', '')
+                    
+                    # 레코드 추가
+                    records.append((
+                        timestamp,
+                        device_id,
+                        resource_type,
+                        metric_name,
+                        float(row[col]),
+                        prediction_type,
+                        prediction_horizon,
+                        prediction_time,
+                        company_domain,
+                        building
+                    ))
+            
+            # 일괄 삽입
+            query = """
+            INSERT INTO prediction_results 
+            (timestamp, device_id, resource_type, metric_name, predicted_value, 
+             prediction_type, prediction_horizon, prediction_time, companyDomain, building)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            
+            cursor.executemany(query, records)
+            conn.commit()
+            
+            logger.info(f"{len(records)}개의 예측 결과가 저장되었습니다. (유형: {prediction_type}, 자원: {resource_type})")
+            
+            cursor.close()
+            conn.close()
+            return True
+            
+        except Exception as e:
+            logger.error(f"예측 결과 저장 실패: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
     
     def process_failure_predictions(self, predictions_df):
         """
@@ -580,10 +931,32 @@ class ResultHandler:
             predictions_df['is_failure_predicted'] = (predictions_df[failure_cols] > failure_threshold).any(axis=1)
             predictions_df['failure_resource'] = max_prob_resource if max_prob_resource else 'none'
         
-        # 1. MySQL에 저장
-        mysql_success = self.save_to_mysql(predictions_df, "failure_predictions")
+        # EAV 모델 사용 여부 확인
+        use_eav_model = self.config.get("database", {}).get("use_eav_model", False)
         
-        # 2. API로 전송
+        if use_eav_model:
+            # 각 자원별로 처리
+            success = True
+            for col in failure_cols:
+                resource_type = col.replace('_failure_probability', '')
+                
+                # 해당 자원의 고장 확률만 추출
+                resource_df = predictions_df[['timestamp', 'device_id', 'companyDomain', 'building', 
+                                             'prediction_time', 'is_failure_predicted', 'failure_resource', col]]
+                
+                # 컬럼명 변경
+                resource_df = resource_df.rename(columns={col: 'failure_probability'})
+                
+                # EAV 모델로 변환하여 저장
+                resource_success = self.save_prediction_results(resource_df, "failure", resource_type)
+                success = success and resource_success
+            
+            return success
+        else:
+            # 기존 방식으로 저장
+            mysql_success = self.save_to_mysql(predictions_df, "failure_predictions")
+        
+        # API로 전송
         api_success = self.send_to_api(predictions_df, "failure_predictions")
         
         return mysql_success and api_success
@@ -695,6 +1068,9 @@ class ResultHandler:
             
             if success:
                 logger.info(f"모델 성능 평가 정보가 기록되었습니다. 유형: {model_type}, 자원: {resource_type}")
+                
+                # 재학습 필요 여부 확인
+                self.check_model_performance(model_type, resource_type, performance_metrics)
             else:
                 logger.warning("모델 성능 평가 정보 기록 실패")
             
@@ -705,6 +1081,250 @@ class ResultHandler:
             import traceback
             logger.error(traceback.format_exc())
             return False
+    
+    def check_model_performance(self, model_type, resource_type, performance_metrics):
+        """
+        모델 성능 확인 및 재학습 트리거
+        
+        Args:
+            model_type (str): 모델 유형 (resource_prediction 또는 failure_prediction)
+            resource_type (str): 자원 유형 (cpu, memory, disk, network, system)
+            performance_metrics (dict): 성능 지표
+            
+        Returns:
+            bool: 재학습 필요 여부
+        """
+        # 자동 재학습 설정 확인
+        auto_retraining = self.config.get("prediction", {}).get("performance_monitoring", {}).get("auto_retraining", False)
+        if not auto_retraining:
+            return False
+        
+        # 성능 임계값 설정
+        thresholds = self.config.get("prediction", {}).get("performance_monitoring", {}).get("thresholds", {})
+        model_thresholds = thresholds.get(model_type, {})
+        
+        # 성능 확인
+        retraining_needed = False
+        
+        if model_type == "resource_prediction":
+            rmse_threshold = model_thresholds.get("rmse", 10.0)
+            mae_threshold = model_thresholds.get("mae", 5.0)
+            
+            if (performance_metrics.get("rmse", 0) > rmse_threshold or 
+                performance_metrics.get("mae", 0) > mae_threshold):
+                retraining_needed = True
+                
+        elif model_type == "failure_prediction":
+            accuracy_threshold = model_thresholds.get("accuracy", 0.7)
+            precision_threshold = model_thresholds.get("precision", 0.6)
+            recall_threshold = model_thresholds.get("recall", 0.6)
+            
+            if (performance_metrics.get("accuracy", 1.0) < accuracy_threshold or 
+                performance_metrics.get("precision", 1.0) < precision_threshold or
+                performance_metrics.get("recall", 1.0) < recall_threshold):
+                retraining_needed = True
+        
+        if retraining_needed:
+            logger.warning(f"{model_type}/{resource_type} 모델 성능이 임계값 미달: 재학습 필요")
+            
+            # 재학습 트리거를 위한 테이블 생성
+            try:
+                conn = mysql.connector.connect(
+                    host=self.mysql_config.get('host'),
+                    port=self.mysql_config.get('port'),
+                    user=self.mysql_config.get('user'),
+                    password=self.mysql_config.get('password'),
+                    database=self.mysql_config.get('database')
+                )
+                
+                cursor = conn.cursor()
+                
+                # 재학습 트리거 테이블 생성
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS model_retraining_triggers (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    model_type VARCHAR(50),
+                    resource_type VARCHAR(50),
+                    trigger_time DATETIME,
+                    reason VARCHAR(255),
+                    status VARCHAR(20),
+                    
+                    INDEX idx_model (model_type, resource_type),
+                    INDEX idx_status (status)
+                )
+                """)
+                
+                # 재학습 트리거 추가
+                cursor.execute("""
+                INSERT INTO model_retraining_triggers
+                (model_type, resource_type, trigger_time, reason, status)
+                VALUES (%s, %s, %s, %s, %s)
+                """, (
+                    model_type, 
+                    resource_type, 
+                    datetime.now(),
+                    f"성능 저하: {json.dumps(performance_metrics)}",
+                    "pending"
+                ))
+                
+                conn.commit()
+                cursor.close()
+                conn.close()
+                
+                logger.info(f"{model_type}/{resource_type} 모델 재학습 트리거가 추가되었습니다.")
+                return True
+                
+            except Exception as e:
+                logger.error(f"모델 재학습 트리거 추가 실패: {e}")
+                return False
+        
+        return False
+    
+    def update_last_collection_time(self, collection_type, device_id, company_domain, building):
+        """
+        마지막 데이터 수집 시간 업데이트
+        
+        Args:
+            collection_type (str): 수집 유형 (resource_type 또는 'all')
+            device_id (str): 장치 ID
+            company_domain (str): 회사 도메인
+            building (str): 건물
+            
+        Returns:
+            bool: 성공 여부
+        """
+        try:
+            conn = mysql.connector.connect(
+                host=self.mysql_config.get('host'),
+                port=self.mysql_config.get('port'),
+                user=self.mysql_config.get('user'),
+                password=self.mysql_config.get('password'),
+                database=self.mysql_config.get('database')
+            )
+            
+            cursor = conn.cursor()
+            
+            # 현재 시간
+            current_time = datetime.now()
+            
+            # 이미 존재하는지 확인
+            cursor.execute("""
+            SELECT id FROM collection_metadata 
+            WHERE collection_type = %s 
+            AND device_id = %s 
+            AND companyDomain = %s 
+            AND building = %s
+            """, (collection_type, device_id, company_domain, building))
+            
+            result = cursor.fetchone()
+            
+            if result:
+                # 기존 레코드 업데이트
+                cursor.execute("""
+                UPDATE collection_metadata 
+                SET last_collection_time = %s 
+                WHERE collection_type = %s 
+                AND device_id = %s 
+                AND companyDomain = %s 
+                AND building = %s
+                """, (current_time, collection_type, device_id, company_domain, building))
+            else:
+                # 새 레코드 삽입
+                cursor.execute("""
+                INSERT INTO collection_metadata 
+                (collection_type, device_id, companyDomain, building, last_collection_time)
+                VALUES (%s, %s, %s, %s, %s)
+                """, (collection_type, device_id, company_domain, building, current_time))
+            
+            # 'all' 유형도 함께 업데이트
+            if collection_type != 'all':
+                # 이미 존재하는지 확인
+                cursor.execute("""
+                SELECT id FROM collection_metadata 
+                WHERE collection_type = 'all' 
+                AND device_id = %s 
+                AND companyDomain = %s 
+                AND building = %s
+                """, (device_id, company_domain, building))
+                
+                result = cursor.fetchone()
+                
+                if result:
+                    # 기존 레코드 업데이트
+                    cursor.execute("""
+                    UPDATE collection_metadata 
+                    SET last_collection_time = %s 
+                    WHERE collection_type = 'all' 
+                    AND device_id = %s 
+                    AND companyDomain = %s 
+                    AND building = %s
+                    """, (current_time, device_id, company_domain, building))
+                else:
+                    # 새 레코드 삽입
+                    cursor.execute("""
+                    INSERT INTO collection_metadata 
+                    (collection_type, device_id, companyDomain, building, last_collection_time)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """, ('all', device_id, company_domain, building, current_time))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            return True
+            
+        except Exception as e:
+            logger.error(f"마지막 수집 시간 업데이트 실패: {e}")
+            return False
+    
+    def get_last_collection_time(self, collection_type, device_id, company_domain, building):
+        """
+        마지막 데이터 수집 시간 조회
+        
+        Args:
+            collection_type (str): 수집 유형 (resource_type 또는 'all')
+            device_id (str): 장치 ID
+            company_domain (str): 회사 도메인
+            building (str): 건물
+            
+        Returns:
+            datetime: 마지막 수집 시간 (없으면 None)
+        """
+        try:
+            conn = mysql.connector.connect(
+                host=self.mysql_config.get('host'),
+                port=self.mysql_config.get('port'),
+                user=self.mysql_config.get('user'),
+                password=self.mysql_config.get('password'),
+                database=self.mysql_config.get('database')
+            )
+            
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+            SELECT last_collection_time FROM collection_metadata 
+            WHERE collection_type = %s 
+            AND device_id = %s 
+            AND companyDomain = %s 
+            AND building = %s
+            """, (collection_type, device_id, company_domain, building))
+            
+            result = cursor.fetchone()
+            
+            cursor.close()
+            conn.close()
+            
+            if result:
+                return result[0]
+            else:
+                # 기본값: 7일 전
+                max_days = self.config.get("data_collection", {}).get("max_days_initial", 7)
+                return datetime.now() - timedelta(days=max_days)
+            
+        except Exception as e:
+            logger.error(f"마지막 수집 시간 조회 실패: {e}")
+            # 기본값: 7일 전
+            max_days = self.config.get("data_collection", {}).get("max_days_initial", 7)
+            return datetime.now() - timedelta(days=max_days)
     
     def test_connections(self):
         """

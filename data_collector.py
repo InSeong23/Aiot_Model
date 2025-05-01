@@ -202,74 +202,156 @@ class DataCollector:
             logger.error(traceback.format_exc())
             return pd.DataFrame()
     
-    def collect_all_resources(self, days=7, save_to_mysql=True):
+    def collect_all_resources(self, start_time=None, end_time=None, save_to_mysql=True):
         """
         모든 자원 데이터 수집 및 전처리
         
         Args:
-            days (int): 수집할 일 수
+            start_time (datetime): 시작 시간 (None이면 마지막 수집 시간 사용)
+            end_time (datetime): 종료 시간 (None이면 현재 시간)
             save_to_mysql (bool): MySQL에 저장 여부
             
         Returns:
             dict: 자원별 전처리된 데이터프레임
         """
-        from data_preprocessor import DataPreprocessor
+        if end_time is None:
+            end_time = datetime.now()
         
-        end_time = datetime.now()
-        start_time = end_time - timedelta(days=days)
+        # 회사/건물/디바이스 목록 가져오기
+        companies = self.config.get("companies", [])
+        if not companies:
+            # 기본 설정 사용
+            default_company = self.config.get('default_company', 'javame')
+            default_building = self.config.get('default_building', 'gyeongnam_campus')
+            default_device = self.config.get('default_device', 'device_001')
+            
+            companies = [{
+                "companyDomain": default_company,
+                "buildings": [{
+                    "name": default_building,
+                    "devices": [default_device]
+                }]
+            }]
         
-        # 자원 위치 목록
-        locations = self.influx_config.get("locations", ["cpu", "disk", "diskio", "mem", "net", "system"])
+        # 결과 저장용 딕셔너리
+        all_processed_data = {}
         
-        # 각 자원별 데이터 수집 및 전처리
-        processed_data = {}
+        # 각 회사/건물/디바이스별로 처리
+        for company in companies:
+            company_domain = company.get("companyDomain")
+            for building in company.get("buildings", []):
+                building_name = building.get("name")
+                for device_id in building.get("devices", []):
+                    logger.info(f"수집 중: {company_domain}/{building_name}/{device_id}")
+                    
+                    # 마지막 수집 시간 가져오기
+                    if start_time is None and self.result_handler:
+                        device_start_time = self.result_handler.get_last_collection_time(
+                            'all', device_id, company_domain, building_name
+                        )
+                    else:
+                        device_start_time = start_time
+                    
+                    # 각 자원별로 데이터 수집
+                    device_data = {}
+                    
+                    # 자원 위치 목록
+                    locations = self.influx_config.get("locations", ["cpu", "disk", "diskio", "mem", "net", "system"])
+                    
+                    for location in locations:
+                        logger.info(f"'{location}' 자원 데이터 수집 시작...")
+                        
+                        # 태그 필터 추가
+                        tags = {
+                            "companyDomain": company_domain,
+                            "building": building_name,
+                            "device_id": device_id
+                        }
+                        
+                        # 이 자원에 대한 마지막 수집 시간 가져오기 (없으면 디바이스 전체 수집 시간 사용)
+                        if start_time is None and self.result_handler:
+                            resource_start_time = self.result_handler.get_last_collection_time(
+                                location, device_id, company_domain, building_name
+                            )
+                            # 두 시간 중 더 최근 시간을 사용하여 중복을 최소화
+                            if device_start_time and resource_start_time:
+                                loc_start_time = max(device_start_time, resource_start_time)
+                            elif device_start_time:
+                                loc_start_time = device_start_time
+                            else:
+                                loc_start_time = resource_start_time
+                        else:
+                            loc_start_time = device_start_time or start_time
+                        
+                        # 해당 자원 데이터 수집
+                        df = self.get_resource_data(location, loc_start_time, end_time, tags)
+                        
+                        if df is None or df.empty:
+                            logger.warning(f"'{location}' 자원 데이터 수집 실패")
+                            continue
+                        
+                        # 기본 메타데이터 추가
+                        if 'device_id' not in df.columns:
+                            df['device_id'] = device_id
+                        if 'companyDomain' not in df.columns:
+                            df['companyDomain'] = company_domain
+                        if 'building' not in df.columns:
+                            df['building'] = building_name
+                        
+                        # 데이터 전처리
+                        from data_preprocessor import DataPreprocessor
+                        preprocessor = DataPreprocessor(self.config)
+                        processed_df = preprocessor.process_resource_data(df, location)
+                        
+                        if processed_df is None or processed_df.empty:
+                            logger.warning(f"'{location}' 자원 데이터 전처리 실패")
+                            continue
+                        
+                        # 결과 저장
+                        device_data[location] = processed_df
+                        
+                        # MySQL에 저장
+                        if save_to_mysql and self.result_handler:
+                            # EAV 모델 사용 여부 확인
+                            use_eav_model = self.config.get("database", {}).get("use_eav_model", False)
+                            
+                            if use_eav_model:
+                                save_success = self.result_handler.save_resource_metrics(processed_df, location)
+                            else:
+                                save_success = self.result_handler.save_processed_data(processed_df)
+                                
+                            if save_success:
+                                logger.info(f"'{location}' 자원 전처리 데이터를 MySQL에 저장했습니다.")
+                            else:
+                                logger.warning(f"'{location}' 자원 전처리 데이터를 MySQL에 저장하지 못했습니다.")
+                    
+                    # 디바이스별 결과 저장
+                    if device_data:
+                        key = f"{company_domain}_{building_name}_{device_id}"
+                        all_processed_data[key] = device_data
         
-        # 전처리기 초기화
-        preprocessor = DataPreprocessor(self.config)
-        
-        for location in locations:
-            logger.info(f"'{location}' 자원 데이터 수집 시작...")
-            
-            # 해당 자원 데이터 수집
-            df = self.get_resource_data(location, days)
-            
-            if df is None or df.empty:
-                logger.warning(f"'{location}' 자원 데이터 수집 실패")
-                continue
-            
-            # 데이터 전처리
-            processed_df = preprocessor.process_resource_data(df, location)
-            
-            if processed_df is None or processed_df.empty:
-                logger.warning(f"'{location}' 자원 데이터 전처리 실패")
-                continue
-            
-            # 결과 저장
-            processed_data[location] = processed_df
-            
-            # MySQL에 저장
-            if save_to_mysql and self.result_handler:
-                save_success = self.result_handler.save_processed_data(processed_df)
-                if save_success:
-                    logger.info(f"'{location}' 자원 전처리 데이터를 MySQL에 저장했습니다.")
-                else:
-                    logger.warning(f"'{location}' 자원 전처리 데이터를 MySQL에 저장하지 못했습니다.")
-        
-        return processed_data
+        return all_processed_data
     
-    def get_resource_data(self, resource_type, days=7):
+    def get_resource_data(self, resource_type, start_time=None, end_time=None, tags=None):
         """
         리소스 유형별 데이터 수집
         
         Args:
             resource_type (str): 리소스 유형 (cpu, mem, disk, diskio, net, system)
-            days (int): 수집할 일 수
+            start_time (datetime): 시작 시간
+            end_time (datetime): 종료 시간
+            tags (dict): 추가 태그 필터
             
         Returns:
             pd.DataFrame: 리소스 데이터
         """
-        end_time = datetime.now()
-        start_time = end_time - timedelta(days=days)
+        if end_time is None:
+            end_time = datetime.now()
+        
+        if start_time is None:
+            # 기본값: 7일 전
+            max_days = self.config.get("data_collection", {}).get("max_days_initial", 7)
+            start_time = end_time - timedelta(days=max_days)
         
         # 리소스 설정 가져오기
         resources_config = self.config.get("resources", {})
@@ -292,6 +374,7 @@ class DataCollector:
             end_time=end_time,
             location=resource_type,
             origins=["server_data"],
+            tags=tags,
             fields=target_columns
         )
     
@@ -313,35 +396,60 @@ class DataCollector:
         end_time = datetime.now()
         start_time = end_time - timedelta(days=days)
         
-        # 필터 조건 생성
-        filter_cond = None
-        if resource_types:
-            # 자원 유형 필드 확인
-            filters = []
-            for resource in resource_types:
-                if resource == 'cpu':
-                    filters.append("cpu_usage IS NOT NULL")
-                elif resource == 'mem':
-                    filters.append("memory_used_percent IS NOT NULL")
-                elif resource == 'disk':
-                    filters.append("disk_used_percent IS NOT NULL")
-                elif resource == 'diskio':
-                    filters.append("disk_io_utilization IS NOT NULL")
-                elif resource == 'net':
-                    filters.append("net_utilization IS NOT NULL")
-                elif resource == 'system':
-                    filters.append("system_load1 IS NOT NULL")
-            
-            if filters:
-                filter_cond = " OR ".join(filters)
+        # EAV 모델 사용 여부 확인
+        use_eav_model = self.config.get("database", {}).get("use_eav_model", False)
         
-        # 데이터 로드
-        return self.result_handler.load_from_mysql(
-            table_name="processed_resource_data",
-            start_time=start_time,
-            end_time=end_time,
-            filter_cond=filter_cond
-        )
+        if use_eav_model:
+            # 각 자원별로 데이터 로드 후 병합
+            result_dfs = []
+            
+            for resource_type in resource_types:
+                resource_df = self.result_handler.load_resource_metrics(
+                    resource_type=resource_type,
+                    start_time=start_time,
+                    end_time=end_time
+                )
+                
+                if not resource_df.empty:
+                    result_dfs.append(resource_df)
+            
+            # 결과 병합
+            if result_dfs:
+                return pd.concat(result_dfs, axis=0)
+            else:
+                return pd.DataFrame()
+        else:
+            # 기존 방식으로 데이터 로드
+            
+            # 필터 조건 생성
+            filter_cond = None
+            if resource_types:
+                # 자원 유형 필드 확인
+                filters = []
+                for resource in resource_types:
+                    if resource == 'cpu':
+                        filters.append("cpu_usage IS NOT NULL")
+                    elif resource == 'mem':
+                        filters.append("memory_used_percent IS NOT NULL")
+                    elif resource == 'disk':
+                        filters.append("disk_used_percent IS NOT NULL")
+                    elif resource == 'diskio':
+                        filters.append("disk_io_utilization IS NOT NULL")
+                    elif resource == 'net':
+                        filters.append("net_utilization IS NOT NULL")
+                    elif resource == 'system':
+                        filters.append("system_load1 IS NOT NULL")
+                
+                if filters:
+                    filter_cond = " OR ".join(filters)
+            
+            # 데이터 로드
+            return self.result_handler.load_from_mysql(
+                table_name="processed_resource_data",
+                start_time=start_time,
+                end_time=end_time,
+                filter_cond=filter_cond
+            )
     
     def get_prediction_data(self, resource_type, days=7, use_mysql=True):
         """
@@ -356,8 +464,22 @@ class DataCollector:
             pd.DataFrame: 예측을 위한 데이터
         """
         if use_mysql and self.result_handler:
-            # MySQL에서 전처리된 데이터 로드
-            df = self.load_processed_data(days, [resource_type])
+            # EAV 모델 사용 여부 확인
+            use_eav_model = self.config.get("database", {}).get("use_eav_model", False)
+            
+            if use_eav_model:
+                # 자원 유형에 맞는 메트릭 로드
+                end_time = datetime.now()
+                start_time = end_time - timedelta(days=days)
+                
+                df = self.result_handler.load_resource_metrics(
+                    resource_type=resource_type,
+                    start_time=start_time,
+                    end_time=end_time
+                )
+            else:
+                # MySQL에서 전처리된 데이터 로드
+                df = self.load_processed_data(days, [resource_type])
             
             if not df.empty:
                 logger.info(f"{resource_type} 예측 데이터를 MySQL에서 로드했습니다: {len(df)}행")
@@ -373,6 +495,19 @@ class DataCollector:
             logger.warning(f"{resource_type} 데이터 수집 실패")
             return pd.DataFrame()
         
+        # 회사/건물/디바이스 정보 설정
+        default_company = self.config.get('default_company', 'javame')
+        default_building = self.config.get('default_building', 'gyeongnam_campus')
+        default_device = self.config.get('default_device', 'device_001')
+        
+        # 기본 메타데이터 추가
+        if 'device_id' not in raw_df.columns:
+            raw_df['device_id'] = default_device
+        if 'companyDomain' not in raw_df.columns:
+            raw_df['companyDomain'] = default_company
+        if 'building' not in raw_df.columns:
+            raw_df['building'] = default_building
+        
         # 데이터 전처리
         from data_preprocessor import DataPreprocessor
         preprocessor = DataPreprocessor(self.config)
@@ -384,7 +519,14 @@ class DataCollector:
         
         # MySQL에 저장
         if use_mysql and self.result_handler:
-            save_success = self.result_handler.save_processed_data(processed_df)
+            # EAV 모델 사용 여부 확인
+            use_eav_model = self.config.get("database", {}).get("use_eav_model", False)
+            
+            if use_eav_model:
+                save_success = self.result_handler.save_resource_metrics(processed_df, resource_type)
+            else:
+                save_success = self.result_handler.save_processed_data(processed_df)
+                
             if save_success:
                 logger.info(f"{resource_type} 전처리 데이터를 MySQL에 저장했습니다.")
         

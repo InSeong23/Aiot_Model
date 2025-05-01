@@ -25,6 +25,35 @@
     "password": "ryL7LcSp@Yiz[bR7",
     "database": "aiot02_team3"
   },
+  "database": {
+    "use_eav_model": true,
+    "tables": {
+      "resource_metrics": true,
+      "prediction_results": true,
+      "model_performance": true,
+      "prediction_runs": true,
+      "collection_metadata": true
+    },
+    "cleanup": {
+      "enabled": true,
+      "archive_days": 365,
+      "delete_days": 730
+    }
+  },
+  "companies": [
+    {
+      "companyDomain": "javame",
+      "buildings": [
+        {
+          "name": "gyeongnam_campus",
+          "devices": ["device_001"]
+        }
+      ]
+    }
+  ],
+  "default_company": "javame",
+  "default_building": "gyeongnam_campus",
+  "default_device": "device_001",
   "prediction": {
     "failure": {
       "enabled": true,
@@ -42,7 +71,22 @@
       "target_column": "used_percent"
     },
     "retraining_days": 7,
-    "visualization": false
+    "visualization": false,
+    "performance_monitoring": {
+      "enabled": true,
+      "thresholds": {
+        "resource_prediction": {
+          "rmse": 10.0,
+          "mae": 5.0
+        },
+        "failure_prediction": {
+          "accuracy": 0.7,
+          "precision": 0.6,
+          "recall": 0.6
+        }
+      },
+      "auto_retraining": true
+    }
   },
   "resources": {
     "cpu": {
@@ -127,6 +171,13 @@
       "building": "gyeongnam_campus",
       "resource_type": "value"
     }
+  },
+  "data_collection": {
+    "interval_hours": 4,
+    "incremental": true,
+    "max_days_initial": 7,
+    "backfill_enabled": true,
+    "batch_size": 1000
   },
   "advanced": {
     "resampling": {

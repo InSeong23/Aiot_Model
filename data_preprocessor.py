@@ -333,56 +333,109 @@ class DataPreprocessor:
             logger.error(traceback.format_exc())
             return pd.DataFrame()
     
-    def process_resource_data(self, df, location):
-        """
-        자원별 데이터 처리
+def process_resource_data(self, df, location, incremental=True):
+    """
+    자원별 데이터 처리
+    
+    Args:
+        df (pd.DataFrame): 데이터프레임
+        location (str): 자원 위치
+        incremental (bool): 증분 처리 여부
         
-        Args:
-            df (pd.DataFrame): 데이터프레임
-            location (str): 자원 위치
-            
-        Returns:
-            pd.DataFrame: 처리된 자원 지표 데이터프레임
-        """
-        if df is None or df.empty:
-            logger.warning(f"{location} 위치의 데이터가 비어 있습니다.")
-            return pd.DataFrame()
+    Returns:
+        pd.DataFrame: 처리된 자원 지표 데이터프레임
+    """
+    if df is None or df.empty:
+        logger.warning(f"{location} 위치의 데이터가 비어 있습니다.")
+        return pd.DataFrame()
+    
+    try:
+        logger.info(f"'{location}' 자원 데이터 처리 시작 ({len(df)}행)")
         
-        try:
-            logger.info(f"'{location}' 자원 데이터 처리 시작 ({len(df)}행)")
+        # 기존 데이터 로드 (증분 처리용)
+        existing_data = None
+        if incremental and self.result_handler:
+            # 최근 처리된 데이터 로드 (마지막 30분)
+            end_time = datetime.now()
+            start_time = end_time - timedelta(minutes=30)
             
-            # 1. 일관된 시간 간격으로 리샘플링
-            resample_freq = self.config.get('advanced', {}).get('resampling', {}).get('freq', '5min')
-            if isinstance(df.index, pd.DatetimeIndex) and self.config.get('advanced', {}).get('resampling', {}).get('enabled', True):
-                df = self.resample_data(df, freq=resample_freq)
+            # EAV 모델 사용 여부 확인
+            use_eav_model = self.config.get("database", {}).get("use_eav_model", False)
             
-            # 2. 결측치 처리
-            if self.config.get('advanced', {}).get('missing_data', {}).get('handle_missing', True):
-                df = self.handle_missing_values(df)
+            if use_eav_model:
+                # 자원 메트릭 테이블에서 로드
+                existing_data = self.result_handler.load_resource_metrics(
+                    resource_type=location,
+                    start_time=start_time,
+                    end_time=end_time
+                )
+            else:
+                # 기존 테이블에서 로드
+                filter_cond = None
+                if location == 'cpu':
+                    filter_cond = "cpu_usage IS NOT NULL"
+                elif location == 'mem':
+                    filter_cond = "memory_used_percent IS NOT NULL"
+                elif location == 'disk':
+                    filter_cond = "disk_used_percent IS NOT NULL"
+                elif location == 'diskio':
+                    filter_cond = "disk_io_utilization IS NOT NULL"
+                elif location == 'net':
+                    filter_cond = "net_utilization IS NOT NULL"
+                elif location == 'system':
+                    filter_cond = "system_load1 IS NOT NULL"
+                
+                existing_data = self.result_handler.load_from_mysql(
+                    table_name="processed_resource_data",
+                    start_time=start_time,
+                    end_time=end_time,
+                    filter_cond=filter_cond
+                )
+        
+        # 중복 제거 (기존 데이터와 겹치는 부분 제외)
+        if existing_data is not None and not existing_data.empty and isinstance(df.index, pd.DatetimeIndex):
+            # 이미 처리된 타임스탬프 찾기
+            processed_times = set(existing_data.index)
             
-            # 3. 이상치 처리
-            if self.config.get('advanced', {}).get('outliers', {}).get('handle_outliers', True):
-                method = self.config.get('advanced', {}).get('outliers', {}).get('method', 'zscore')
-                threshold = self.config.get('advanced', {}).get('outliers', {}).get('threshold', 3.0)
-                df = self.handle_outliers(df, method=method, threshold=threshold)
+            # 새 데이터에서 중복 제외
+            df = df[~df.index.isin(processed_times)]
             
-            # 4. 자원 지표 계산
-            result_df = self.calculate_resource_metrics(df)
-            
-            # CSV 저장 (필요시)
-            if self.config.get('advanced', {}).get('save_csv', False):
-                csv_path = f"{location}_metrics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-                result_df.to_csv(csv_path)
-                logger.info(f"자원 지표 CSV 저장: {csv_path}")
-            
-            logger.info(f"'{location}' 자원 데이터 처리 완료 ({len(result_df)}행)")
-            return result_df
-            
-        except Exception as e:
-            logger.error(f"'{location}' 자원 데이터 처리 중 오류 발생: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return pd.DataFrame()
+            if df.empty:
+                logger.info(f"증분 처리: 새로운 데이터가 없습니다. ({location})")
+                return pd.DataFrame()
+        
+        # 1. 일관된 시간 간격으로 리샘플링
+        resample_freq = self.config.get('advanced', {}).get('resampling', {}).get('freq', '5min')
+        if isinstance(df.index, pd.DatetimeIndex) and self.config.get('advanced', {}).get('resampling', {}).get('enabled', True):
+            df = self.resample_data(df, freq=resample_freq)
+        
+        # 2. 결측치 처리
+        if self.config.get('advanced', {}).get('missing_data', {}).get('handle_missing', True):
+            df = self.handle_missing_values(df)
+        
+        # 3. 이상치 처리
+        if self.config.get('advanced', {}).get('outliers', {}).get('handle_outliers', True):
+            method = self.config.get('advanced', {}).get('outliers', {}).get('method', 'zscore')
+            threshold = self.config.get('advanced', {}).get('outliers', {}).get('threshold', 3.0)
+            df = self.handle_outliers(df, method=method, threshold=threshold)
+        
+        # 4. 자원 지표 계산
+        result_df = self.calculate_resource_metrics(df)
+        
+        # CSV 저장 (필요시)
+        if self.config.get('advanced', {}).get('save_csv', False):
+            csv_path = f"{location}_metrics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            result_df.to_csv(csv_path)
+            logger.info(f"자원 지표 CSV 저장: {csv_path}")
+        
+        logger.info(f"'{location}' 자원 데이터 처리 완료 ({len(result_df)}행)")
+        return result_df
+        
+    except Exception as e:
+        logger.error(f"'{location}' 자원 데이터 처리 중 오류 발생: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return pd.DataFrame()
     
     def prepare_data_for_prediction(self, df, target_cols=None, scale=True):
         """

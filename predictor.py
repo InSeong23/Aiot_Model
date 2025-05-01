@@ -592,6 +592,11 @@ class Predictor:
         if not os.path.exists(model_path):
             return True
         
+        # 강제 재학습 플래그 확인
+        if hasattr(self, '_force_retraining_flag') and self._force_retraining_flag.get(model_key, False):
+            self._force_retraining_flag[model_key] = False  # 플래그 초기화
+            return True
+        
         # 모델 재학습 주기 확인 (일주일에 한 번)
         model_stats = os.stat(model_path)
         last_modified = datetime.fromtimestamp(model_stats.st_mtime)
@@ -601,7 +606,67 @@ class Predictor:
         retraining_days = self.config.get("prediction", {}).get("retraining_days", 7)
         
         return days_since_modified >= retraining_days
-    
+    def check_and_trigger_retraining(self, model_key, performance_metrics):
+        """
+        모델 성능 확인 및 재학습 트리거
+        
+        Args:
+            model_key (str): 모델 키
+            performance_metrics (dict): 성능 지표
+            
+        Returns:
+            bool: 재학습 필요 여부
+        """
+        # 성능 임계값 설정
+        performance_thresholds = self.config.get("prediction", {}).get("performance_monitoring", {}).get("thresholds", {})
+        
+        # 모델 유형 확인
+        model_type = "resource_prediction" if "usage" in model_key else "failure_prediction"
+        
+        # 임계값 가져오기
+        model_thresholds = performance_thresholds.get(model_type, {})
+        
+        # 성능 확인
+        retraining_needed = False
+        
+        if model_type == "resource_prediction":
+            rmse_threshold = model_thresholds.get("rmse", 10.0)
+            mae_threshold = model_thresholds.get("mae", 5.0)
+            
+            if (performance_metrics.get("rmse", 0) > rmse_threshold or 
+                performance_metrics.get("mae", 0) > mae_threshold):
+                retraining_needed = True
+        else:  # failure_prediction
+            accuracy_threshold = model_thresholds.get("accuracy", 0.7)
+            precision_threshold = model_thresholds.get("precision", 0.6)
+            recall_threshold = model_thresholds.get("recall", 0.6)
+            
+            if (performance_metrics.get("accuracy", 1.0) < accuracy_threshold or 
+                performance_metrics.get("precision", 1.0) < precision_threshold or
+                performance_metrics.get("recall", 1.0) < recall_threshold):
+                retraining_needed = True
+        
+        if retraining_needed:
+            logger.warning(f"{model_key} 모델 성능이 임계값 미달: 재학습 트리거")
+            
+            # 재학습 플래그 설정
+            if not hasattr(self, '_force_retraining_flag'):
+                self._force_retraining_flag = {}
+            
+            self._force_retraining_flag[model_key] = True
+            
+            # 재학습이 필요한 모델 정보 로그 및 알림
+            if self.result_handler:
+                self.result_handler.record_model_performance(
+                    model_type="retraining_" + model_type,
+                    resource_type=model_key.split('_')[0],
+                    performance_metrics={
+                        "reason": "성능 저하",
+                        "metrics": performance_metrics
+                    }
+                )
+        
+        return retraining_needed
     def _get_target_columns(self, resource_type):
         """
         자원 유형별 타겟 열 가져오기
