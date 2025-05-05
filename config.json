@@ -5,8 +5,7 @@
     "org": "javame",
     "bucket": "data",
     "origins": [
-      "server_data",
-      "sensor_data"
+      "server_data"
     ],
     "locations": [
       "cpu",
@@ -14,7 +13,6 @@
       "diskio",
       "mem",
       "net",
-      "sensors",
       "system"
     ]
   },
@@ -42,7 +40,11 @@
       "target_column": "used_percent"
     },
     "retraining_days": 7,
-    "visualization": false
+    "visualization": false,
+    "fallback": {
+      "enabled": true,
+      "use_average_of_last": 3
+    }
   },
   "resources": {
     "cpu": {
@@ -118,11 +120,19 @@
     }
   },
   "api": {
-    "url": "http://localhost:10272/ai/data"
+    "url": "http://localhost:10272/ai/data",
+    "enabled": false,
+    "test_mode": true,
+    "retry": {
+      "enabled": true,
+      "max_attempts": 3,
+      "backoff_factor": 2,
+      "timeout": 30
+    }
   },
   "data_processing": {
     "default_values": {
-      "device_id": "device_001",
+      "device_id": "192.168.71.74",
       "companyDomain": "javame",
       "building": "gyeongnam_campus",
       "resource_type": "value"
@@ -131,18 +141,63 @@
   "advanced": {
     "resampling": {
       "enabled": true,
-      "freq": "5min"
+      "freq": "1H"
     },
     "missing_data": {
       "handle_missing": true,
-      "max_missing_ratio": 0.5
+      "max_missing_ratio": 0.8,
+      "fill_method": "ffill"
     },
     "outliers": {
       "handle_outliers": true,
-      "method": "zscore",
-      "threshold": 3.0
+      "method": "iqr",
+      "threshold": 2.0
     },
     "save_csv": false,
     "log_level": "INFO"
+  },
+  "database": {
+    "use_eav_model": true,
+    "batch_size": 1000,
+    "partition_strategy": {
+      "enabled": true,
+      "interval": "month",
+      "retention_months": 12
+    },
+    "archive": {
+      "enabled": true,
+      "retention_months": 24
+    },
+    "tables": {
+      "resource_metrics": true,
+      "prediction_results": true,
+      "model_performance": true,
+      "prediction_runs": true,
+      "collection_metadata": true
+    },
+    "cleanup": {
+      "enabled": true,
+      "archive_days": 365,
+      "delete_days": 730
+    }
+  },
+  "companies": [
+    {
+      "companyDomain": "javame",
+      "company_name": "JavaMe Corp",
+      "buildings": [
+        {
+          "name": "gyeongnam_campus",
+          "location": "Gyeongnam, Korea",
+          "devices": [
+            "192.168.71.74"
+          ]
+        }
+      ]
+    }
+  ],
+  "data_collection": {
+    "max_days_initial": 7,
+    "incremental": true
   }
 }

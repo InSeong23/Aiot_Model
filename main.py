@@ -25,7 +25,9 @@ import traceback
 from datetime import datetime, timedelta
 import argparse
 import schedule
-
+import warnings
+import urllib3
+from influxdb_client.client.warnings import MissingPivotFunction
 # 내부 모듈
 from data_collector import DataCollector
 from data_preprocessor import DataPreprocessor
@@ -37,12 +39,26 @@ CONFIG_PATH = 'config.json'
 LOG_FILE = 'logs/prediction.log'
 
 # 전역 변수
-logger = None
+logger = logging.getLogger(__name__)
 config = None
 collector = None
 preprocessor = None
 predictor = None
 result_handler = None
+
+# InfluxDB 피벗 경고 무시
+warnings.simplefilter("ignore", MissingPivotFunction)
+
+# InsecureRequestWarning 경고 무시
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# pandas SettingWithCopyWarning 경고 무시
+import pandas as pd
+pd.options.mode.chained_assignment = None
+
+# 다른 경고도 모두 무시하려면 (권장하지 않음)
+# warnings.filterwarnings("ignore")
+
 
 def setup_logging(log_level=logging.INFO):
     """
@@ -235,7 +251,108 @@ def load_config(config_path=CONFIG_PATH):
         print(f"설정 파일 저장 실패: {e}")
     
     return final_config
-
+def initialize_models():
+    """
+    초기 모델 학습 (필요한 경우)
+    
+    Returns:
+        bool: 초기화 성공 여부
+    """
+    global config, collector, predictor, result_handler
+    
+    logger.info("모델 초기화 검사 중...")
+    
+    # 입력 검증
+    if config is None:
+        logger.error("설정이 초기화되지 않았습니다. 모델 초기화를 건너뜁니다.")
+        return False
+    
+    # 모델 디렉토리 확인
+    model_dir = os.path.join(os.getcwd(), 'model_weights')
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir)
+    
+    # 모델 파일 존재 여부 확인
+    model_exists = False
+    resources_config = config.get("resources", {})
+    
+    for resource_type, resource_conf in resources_config.items():
+        prediction_types = resource_conf.get("prediction_type", [])
+        if isinstance(prediction_types, str):
+            prediction_types = [prediction_types]
+        
+        if "resource" in prediction_types:
+            model_key = f"{resource_type}_usage"
+            model_path = os.path.join(model_dir, f"{model_key}_model.h5")
+            if os.path.exists(model_path):
+                model_exists = True
+                break
+        
+        if "failure" in prediction_types:
+            model_key = f"{resource_type}_failure"
+            model_path = os.path.join(model_dir, f"{model_key}_model.h5")
+            if os.path.exists(model_path):
+                model_exists = True
+                break
+    
+    # 모델이 없으면 초기 데이터 수집 및 학습
+    if not model_exists:
+        logger.info("모델 파일이 존재하지 않습니다. 초기 학습을 시작합니다.")
+        
+        # 1. 데이터 수집 (7일)
+        logger.info("초기 학습을 위한 데이터 수집 중...")
+        
+        # 7일 전부터 데이터 수집
+        end_time = datetime.now()
+        start_time = end_time - timedelta(days=7)
+        
+        # InfluxDB 연결 확인
+        if not collector.connect():
+            logger.error("InfluxDB 연결 실패. 초기 학습을 건너뜁니다.")
+            return False
+        
+        # 데이터 수집
+        processed_data = collector.collect_all_resources(start_time=start_time, end_time=end_time, save_to_mysql=True)
+        
+        if not processed_data:
+            logger.error("초기 학습을 위한 데이터 수집 실패. 학습을 건너뜁니다.")
+            return False
+        
+        # 2. 모델 학습
+        logger.info("초기 모델 학습 시작...")
+        
+        for resource_type, resource_conf in resources_config.items():
+            prediction_types = resource_conf.get("prediction_type", [])
+            if isinstance(prediction_types, str):
+                prediction_types = [prediction_types]
+            
+            # 자원 데이터 찾기
+            resource_data = None
+            for device_key, device_data in processed_data.items():
+                if resource_type in device_data:
+                    resource_data = device_data[resource_type]
+                    break
+            
+            if resource_data is None or resource_data.empty:
+                logger.warning(f"{resource_type} 자원 데이터가 없어 학습을 건너뜁니다.")
+                continue
+            
+            # 자원 사용량 예측 학습
+            if "resource" in prediction_types:
+                logger.info(f"{resource_type} 자원 사용량 예측 모델 학습 중...")
+                pred_horizon = config.get("prediction", {}).get("resource", {}).get("pred_horizon", 24)
+                predictor.predict_resource_usage(resource_data, resource_type, horizon=pred_horizon)
+            
+            # 고장 예측 학습
+            if "failure" in prediction_types:
+                logger.info(f"{resource_type} 고장 예측 모델 학습 중...")
+                predictor.predict_failures(resource_data, resource_type)
+        
+        logger.info("초기 모델 학습 완료")
+        return True
+    else:
+        logger.info("모델 파일이 이미 존재합니다. 초기 학습을 건너뜁니다.")
+        return True
 def deep_update(d, u):
     """
     딕셔너리 깊은 업데이트
@@ -283,35 +400,36 @@ def init_components():
     return collector, preprocessor, predictor, result_handler
 
 def run_data_collection():
-    """
-    데이터 수집 및 전처리 작업 실행
-    
-    Returns:
-        bool: 성공 여부
-    """
+    """데이터 수집 및 전처리 작업 실행"""
     logger.info("===== 데이터 수집 및 전처리 작업 시작 =====")
     
     # 실행 시작 시간
     start_time = datetime.now()
     
     try:
-        # 최근 7일간의 데이터 수집 및 전처리
-        processed_data = collector.collect_all_resources(days=7)
+        # 증분 수집: 마지막 수집 시간 이후의 데이터만 수집
+        # 자동으로 각 디바이스 및 자원별 마지막 수집 시간을 사용함
+        processed_data = collector.collect_all_resources(save_to_mysql=True)
         
         if processed_data:
-            resources_count = len(processed_data)
-            logger.info(f"데이터 수집 및 전처리 완료: {resources_count}개 자원")
+            company_count = len(processed_data)
+            logger.info(f"데이터 수집 및 전처리 완료: {company_count}개 회사/디바이스")
             
-            # 각 자원별 데이터 행 수 로깅
-            for resource_type, df in processed_data.items():
-                logger.info(f"- {resource_type}: {len(df)}행")
+            # 각 회사/디바이스별 데이터 로깅
+            for key, data in processed_data.items():
+                resource_count = len(data)
+                logger.info(f"- {key}: {resource_count}개 자원")
+                
+                # 각 자원별 데이터 행 수 로깅
+                for resource_type, df in data.items():
+                    logger.info(f"  - {resource_type}: {len(df)}행")
             
             logger.info("===== 데이터 수집 및 전처리 작업 완료 =====")
             return True
         else:
-            logger.error("데이터 수집 및 전처리 실패")
-            logger.info("===== 데이터 수집 및 전처리 작업 실패 =====")
-            return False
+            logger.warning("데이터 수집 및 전처리 결과가 없습니다.")
+            logger.info("===== 데이터 수집 및 전처리 작업 완료 =====")
+            return True
     
     except Exception as e:
         logger.error(f"데이터 수집 중 오류 발생: {e}")
@@ -570,7 +688,7 @@ def handle_exit(signum, frame):
 
 def main():
     """메인 함수"""
-    global logger, config
+    global logger, config, collector, preprocessor, predictor, result_handler
     
     try:
         # 명령행 인자 파싱
@@ -628,6 +746,10 @@ def main():
         # 컴포넌트 초기화
         logger.info("시스템 컴포넌트 초기화 중...")
         init_components()
+        
+        # 모델 초기화 (컴포넌트 초기화 이후에 호출)
+        logger.info("모델 초기화 및 확인 중...")
+        initialize_models()
         
         # 데이터베이스 연결 테스트
         if args.check_db:
@@ -714,5 +836,10 @@ def main():
         return 1
 
 if __name__ == "__main__":
-    result = main()
-    sys.exit(result)
+    try:
+        sys.exit(main())
+    except Exception as e:
+        logger.critical(f"테스트 중 예상치 못한 오류 발생: {e}")
+        import traceback
+        logger.critical(traceback.format_exc())
+        sys.exit(1)

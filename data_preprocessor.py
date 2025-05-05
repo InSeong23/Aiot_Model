@@ -32,6 +32,7 @@ class DataPreprocessor:
         self.config = config or {}
         self.scaler = None
         self.feature_scaler = None
+        self.result_handler = None  # 추가: result_handler 초기화
         
         # 리소스 한계값 설정
         resources_limits = self.config.get('resources_limits', {})
@@ -40,14 +41,23 @@ class DataPreprocessor:
         
         # 이전 데이터 저장용 캐시
         self.prev_data = {}
-    
-    def resample_data(self, df, freq='5min'):
+
+    def set_result_handler(self, result_handler):
         """
-        데이터 리샘플링
+        결과 핸들러 설정
+        
+        Args:
+            result_handler (ResultHandler): 결과 핸들러 객체
+        """
+        self.result_handler = result_handler
+    
+    def resample_data(self, df, freq=None):
+        """
+        데이터 리샘플링 (기본 1시간 단위)
         
         Args:
             df (pd.DataFrame): 데이터프레임
-            freq (str): 리샘플링 주기
+            freq (str): 리샘플링 주기 (None일 경우 config에서 가져옴)
             
         Returns:
             pd.DataFrame: 리샘플링된 데이터프레임
@@ -56,27 +66,55 @@ class DataPreprocessor:
             logger.warning("리샘플링할 데이터가 비어 있습니다.")
             return df
         
+        # 설정에서 리샘플링 주기 가져오기 (기본값: 1시간)
+        if freq is None:
+            freq = self.config.get('advanced', {}).get('resampling', {}).get('freq', '1H')
+            logger.info(f"리샘플링 주기: {freq}")
+        
         if not isinstance(df.index, pd.DatetimeIndex):
-            logger.error("리샘플링을 위해서는 타임스탬프 인덱스가 필요합니다.")
-            return df
+            logger.warning("리샘플링을 위해서는 타임스탬프 인덱스가 필요합니다.")
+            # 인덱스가 타임스탬프가 아니면서 'timestamp' 또는 '_time' 열이 있는 경우 처리
+            if 'timestamp' in df.columns:
+                logger.info("'timestamp' 열을 인덱스로 설정합니다.")
+                df = df.set_index('timestamp')
+            elif '_time' in df.columns:
+                logger.info("'_time' 열을 인덱스로 설정합니다.")
+                df = df.set_index('_time')
+            else:
+                logger.error("타임스탬프 열을 찾을 수 없습니다.")
+                return df
         
         # 숫자형 열 선택
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         
         try:
             # 리샘플링 (평균값 사용)
-            resampled = df[numeric_cols].resample(freq).mean()
+            if len(numeric_cols) > 0:
+                resampled = df[numeric_cols].resample(freq).mean()
+            else:
+                logger.warning("숫자형 열이 없어 리샘플링을 수행할 수 없습니다.")
+                return df
             
             # 결측치 처리
             resampled = resampled.interpolate(method='time').bfill().ffill()
             
             # 메타데이터 컬럼(location, origin, device_id 등) 복원
-            # 가장 많이 등장하는 값 사용
             for col in df.columns:
                 if col not in numeric_cols and col not in resampled.columns:
-                    # 가장 많이 등장하는 값 찾기
-                    most_common = df[col].mode()[0] if not df[col].empty else None
-                    resampled[col] = most_common
+                    try:
+                        # 모드(최빈값) 계산
+                        mode_series = df[col].mode()
+                        if not mode_series.empty:
+                            most_common = mode_series.iloc[0]
+                        else:
+                            # 최빈값이 없으면 첫 번째 비 NaN 값 사용
+                            non_nan_values = df[col].dropna()
+                            most_common = non_nan_values.iloc[0] if not non_nan_values.empty else None
+                        
+                        resampled[col] = most_common
+                    except Exception as e:
+                        logger.warning(f"'{col}' 열의 메타데이터 복원 실패: {e}")
+                        resampled[col] = None
             
             logger.info(f"데이터 리샘플링 완료: {len(df)}행 -> {len(resampled)}행 (주기: {freq})")
             return resampled
@@ -89,7 +127,7 @@ class DataPreprocessor:
     
     def handle_missing_values(self, df, numeric_cols=None):
         """
-        결측치 처리
+        결측치 처리 (개선)
         
         Args:
             df (pd.DataFrame): 데이터프레임
@@ -108,24 +146,65 @@ class DataPreprocessor:
         
         # 결측치 비율 확인
         missing_ratio = df[numeric_cols].isna().mean()
-        high_missing_cols = missing_ratio[missing_ratio > 0.5].index.tolist()
+        max_missing_ratio = self.config.get('advanced', {}).get('missing_data', {}).get('max_missing_ratio', 0.8)
+        high_missing_cols = missing_ratio[missing_ratio > max_missing_ratio].index.tolist()
         
         if high_missing_cols:
-            logger.warning(f"다음 열은 50% 이상의 결측치를 가지고 있습니다: {high_missing_cols}")
+            logger.warning(f"다음 열은 {max_missing_ratio*100}% 이상의 결측치를 가지고 있습니다: {high_missing_cols}")
         
         try:
-            # 타임스탬프 인덱스가 있으면 시계열 보간법 사용
+            # 타임스탬프 인덱스가 있는 경우 시계열 데이터로 간주
             if isinstance(df.index, pd.DatetimeIndex):
-                df[numeric_cols] = df[numeric_cols].interpolate(method='time').bfill().ffill()
+                # 연속적인 인덱스 확인
+                if len(df.index) > 1:
+                    time_diff = df.index.to_series().diff().median()
+                    
+                    # 시간 순서대로 정렬
+                    df = df.sort_index()
+                    
+                    # 결측치 처리 방법 가져오기
+                    fill_method = self.config.get('advanced', {}).get('missing_data', {}).get('fill_method', 'ffill')
+                    
+                    # 결측치 처리
+                    if fill_method == 'ffill':
+                        # 앞의 값으로 채우기
+                        df[numeric_cols] = df[numeric_cols].ffill()
+                        # 그래도 남아있는 결측치는 뒤의 값으로 채우기
+                        df[numeric_cols] = df[numeric_cols].bfill()
+                    elif fill_method == 'bfill':
+                        # 뒤의 값으로 채우기
+                        df[numeric_cols] = df[numeric_cols].bfill()
+                        # 그래도 남아있는 결측치는 앞의 값으로 채우기
+                        df[numeric_cols] = df[numeric_cols].ffill()
+                    else:
+                        # 시계열 보간법
+                        df[numeric_cols] = df[numeric_cols].interpolate(method='time').ffill().bfill()
+                else:
+                    # 단일 행인 경우 평균값으로 대체 (해당 열의 값)
+                    for col in numeric_cols:
+                        if pd.isna(df[col]).any():
+                            df[col] = df[col].fillna(0)  # 기본값으로 0 사용
             else:
-                df[numeric_cols] = df[numeric_cols].interpolate(method='linear').bfill().ffill()
+                # 일반 데이터는 선형 보간법 사용
+                df[numeric_cols] = df[numeric_cols].interpolate(method='linear').ffill().bfill()
             
-            # 여전히 남아있는 결측치는 평균값으로 대체
+            # 여전히 남아있는 결측치는 열별 평균으로 대체
             for col in numeric_cols:
                 if df[col].isna().any():
                     mean_val = df[col].mean()
-                    df[col].fillna(mean_val, inplace=True)
-                    logger.info(f"'{col}' 열의 남은 결측치를 평균값({mean_val:.2f})으로 대체")
+                    if pd.isna(mean_val):  # 열 전체가 NaN인 경우
+                        mean_val = 0
+                    df[col] = df[col].fillna(mean_val)
+                    logger.info(f"'{col}' 열의 남은 결측치를 값({mean_val:.2f})으로 대체")
+            
+            # 비수치 열의 결측치 처리
+            non_numeric_cols = [col for col in df.columns if col not in numeric_cols]
+            for col in non_numeric_cols:
+                if df[col].isna().any():
+                    # 가장 많이 등장하는 값으로 대체 (없으면 '알 수 없음')
+                    mode_val = df[col].mode().iloc[0] if not df[col].mode().empty else '알 수 없음'
+                    df[col] = df[col].fillna(mode_val)
+                    logger.info(f"'{col}' 열의 결측치를 최빈값('{mode_val}')으로 대체")
             
             return df
             
@@ -198,7 +277,7 @@ class DataPreprocessor:
     
     def calculate_resource_metrics(self, df):
         """
-        자원별 사용량 지표 계산
+        자원별 사용량 지표 계산 (개선됨)
         
         Args:
             df (pd.DataFrame): 데이터프레임
@@ -208,120 +287,107 @@ class DataPreprocessor:
         """
         if df is None or df.empty:
             logger.warning("자원 지표를 계산할 데이터가 비어 있습니다.")
-            return df
+            return pd.DataFrame()
         
         try:
             # 결과 데이터프레임 초기화 - 원본 인덱스 유지
             metrics_df = pd.DataFrame(index=df.index)
             
             # 기본 메타데이터 복사
-            for col in ['device_id', 'companyDomain', 'building', 'location', 'origin']:
+            meta_columns = ['device_id', 'companyDomain', 'building', 'location', 'origin']
+            for col in meta_columns:
                 if col in df.columns:
-                    metrics_df[col] = df[col].iloc[0] if len(df) > 0 else None
+                    non_na_values = df[col].dropna()
+                    if not non_na_values.empty:
+                        # 첫 번째 비 NaN 값 사용
+                        metrics_df[col] = non_na_values.iloc[0]
+            
+            # 데이터에 value 컬럼이 있는지 확인
+            has_value_column = '_value' in df.columns or 'value' in df.columns
+            value_column = 'value' if 'value' in df.columns else '_value' if '_value' in df.columns else None
+            
+            # 위치(location) 확인
+            location = None
+            if 'location' in df.columns:
+                loc_values = df['location'].dropna().unique()
+                location = loc_values[0] if len(loc_values) > 0 else None
             
             # 1. CPU 지표 계산
-            if 'usage_idle' in df.columns:
-                # CPU 사용률 = 100 - 유휴율
-                metrics_df['cpu_usage'] = 100 - df['usage_idle']
-                
-                # CPU 사용자/시스템 비율
-                if 'usage_user' in df.columns and 'usage_system' in df.columns:
-                    # 0으로 나누기 방지
-                    safe_divisor = np.maximum(df['usage_system'], 0.1)
-                    metrics_df['cpu_user_system_ratio'] = df['usage_user'] / safe_divisor
+            if location == 'cpu':
+                # CPU 사용률 계산
+                if 'usage_idle' in df.columns:
+                    metrics_df['cpu_usage'] = 100 - df['usage_idle']
+                elif value_column and has_value_column:
+                    # value 열을 직접 사용
+                    metrics_df['cpu_usage'] = df[value_column]
             
             # 2. 메모리 지표
-            if 'used_percent' in df.columns and df['location'].iloc[0] == 'mem':
-                metrics_df['memory_used_percent'] = df['used_percent']
+            elif location == 'mem':
+                # 메모리 사용률 계산
+                if 'used_percent' in df.columns:
+                    metrics_df['memory_used_percent'] = df['used_percent']
+                elif value_column and has_value_column:
+                    # value 열을 직접 사용
+                    metrics_df['memory_used_percent'] = df[value_column]
             
             # 3. 디스크 지표
-            if 'used_percent' in df.columns and df['location'].iloc[0] == 'disk':
-                metrics_df['disk_used_percent'] = df['used_percent']
+            elif location == 'disk':
+                if 'used_percent' in df.columns:
+                    metrics_df['disk_used_percent'] = df['used_percent']
+                elif value_column and has_value_column:
+                    metrics_df['disk_used_percent'] = df[value_column]
             
             # 4. 디스크 I/O 지표
-            if df['location'].iloc[0] == 'diskio':
-                # 변화율 계산을 위해 시간 간격 계산
-                if isinstance(df.index, pd.DatetimeIndex) and len(df) > 1:
-                    # 이전값과 시간 차이 계산
-                    df_shifted = df.shift(1)
-                    time_diff = (df.index - df_shifted.index).total_seconds()
-                    
-                    # 읽기/쓰기 속도 계산
-                    if 'read_bytes' in df.columns:
-                        read_diff = df['read_bytes'] - df_shifted['read_bytes']
-                        metrics_df['disk_read_rate'] = read_diff / time_diff
-                    
-                    if 'write_bytes' in df.columns:
-                        write_diff = df['write_bytes'] - df_shifted['write_bytes']
-                        metrics_df['disk_write_rate'] = write_diff / time_diff
-                    
-                    # I/O 사용률 계산
-                    if 'disk_read_rate' in metrics_df.columns and 'disk_write_rate' in metrics_df.columns:
-                        total_io = metrics_df['disk_read_rate'] + metrics_df['disk_write_rate']
-                        metrics_df['disk_io_utilization'] = (total_io / self.disk_max_io_rate) * 100
-                
-                # I/O 대기 시간 
-                if 'io_time' in df.columns and len(df) > 1:
-                    df_shifted = df.shift(1)
-                    if isinstance(df.index, pd.DatetimeIndex):
-                        time_diff = (df.index - df_shifted.index).total_seconds()
-                        io_diff = df['io_time'] - df_shifted['io_time']
-                        metrics_df['io_wait_rate'] = io_diff / time_diff
+            elif location == 'diskio':
+                # I/O 대기 시간 또는 직접 값 사용
+                if 'io_time' in df.columns:
+                    metrics_df['disk_io_utilization'] = df['io_time']
+                elif value_column and has_value_column:
+                    metrics_df['disk_io_utilization'] = df[value_column]
             
             # 5. 네트워크 지표
-            if df['location'].iloc[0] == 'net':
-                # 변화율 계산을 위해 시간 간격 계산
-                if isinstance(df.index, pd.DatetimeIndex) and len(df) > 1:
-                    # 이전값과 시간 차이 계산
-                    df_shifted = df.shift(1)
-                    time_diff = (df.index - df_shifted.index).total_seconds()
-                    
-                    # 1. 네트워크 처리량 (bytes/sec)
-                    if 'bytes_sent' in df.columns:
-                        sent_diff = df['bytes_sent'] - df_shifted['bytes_sent']
-                        metrics_df['net_throughput_sent'] = sent_diff / time_diff
-                    
-                    if 'bytes_recv' in df.columns:
-                        recv_diff = df['bytes_recv'] - df_shifted['bytes_recv']
-                        metrics_df['net_throughput_recv'] = recv_diff / time_diff
-                    
-                    # 2. 패킷 손실률
-                    if 'drop_in' in df.columns and 'bytes_recv' in df.columns:
-                        drop_in_diff = df['drop_in'] - df_shifted['drop_in']
-                        recv_diff = np.maximum(df['bytes_recv'] - df_shifted['bytes_recv'], 1)  # 0으로 나누기 방지
-                        metrics_df['net_drop_rate_in'] = drop_in_diff / recv_diff
-                    
-                    if 'drop_out' in df.columns and 'bytes_sent' in df.columns:
-                        drop_out_diff = df['drop_out'] - df_shifted['drop_out']
-                        sent_diff = np.maximum(df['bytes_sent'] - df_shifted['bytes_sent'], 1)
-                        metrics_df['net_drop_rate_out'] = drop_out_diff / sent_diff
-                    
-                    # 3. 에러율 (초당 오류 발생 수)
-                    if 'err_in' in df.columns:
-                        err_in_diff = df['err_in'] - df_shifted['err_in']
-                        metrics_df['net_error_rate_in'] = err_in_diff / time_diff
-                    
-                    if 'err_out' in df.columns:
-                        err_out_diff = df['err_out'] - df_shifted['err_out']
-                        metrics_df['net_error_rate_out'] = err_out_diff / time_diff
-                    
-                    # 4. 네트워크 사용률 (%)
-                    if 'net_throughput_sent' in metrics_df.columns and 'net_throughput_recv' in metrics_df.columns:
-                        total_throughput = metrics_df['net_throughput_sent'] + metrics_df['net_throughput_recv']
-                        metrics_df['net_utilization'] = (total_throughput / self.network_max_bandwidth) * 100
+            elif location == 'net':
+                if value_column and has_value_column:
+                    metrics_df['net_utilization'] = df[value_column]
+                
+                # 네트워크 관련 필드가 있으면 사용
+                for field in ['bytes_recv', 'bytes_sent', 'drop_in', 'drop_out']:
+                    if field in df.columns:
+                        metrics_df[f'net_{field}'] = df[field]
             
             # 6. 시스템 부하 지표
-            if 'load1' in df.columns and df['location'].iloc[0] == 'system':
-                metrics_df['system_load1'] = df['load1']
+            elif location == 'system':
+                if 'load1' in df.columns:
+                    metrics_df['system_load1'] = df['load1']
+                elif value_column and has_value_column:
+                    metrics_df['system_load1'] = df[value_column]
             
-            # 첫 번째 행 결과가 NaN인 경우(변화율 계산 불가) 제거
-            metrics_df = metrics_df.iloc[1:] if len(metrics_df) > 1 else metrics_df
+            # 가용한 데이터가 없는 경우
+            if metrics_df.shape[1] <= len(meta_columns):
+                logger.warning(f"자원 '{location}'에 대한 지표를 계산할 수 없습니다. 직접 value 열 사용")
+                
+                # value 열이 있으면 직접 사용
+                if value_column and has_value_column:
+                    if location == 'cpu':
+                        metrics_df['cpu_usage'] = df[value_column]
+                    elif location == 'mem':
+                        metrics_df['memory_used_percent'] = df[value_column]
+                    elif location == 'disk':
+                        metrics_df['disk_used_percent'] = df[value_column]
+                    elif location == 'diskio':
+                        metrics_df['disk_io_utilization'] = df[value_column]
+                    elif location == 'net':
+                        metrics_df['net_utilization'] = df[value_column]
+                    elif location == 'system':
+                        metrics_df['system_load1'] = df[value_column]
+                    else:
+                        metrics_df[f'{location}_value'] = df[value_column]
             
             # NaN 값 처리
             metrics_df = metrics_df.fillna(0)
             
             # 범위 제한 (0-100% 사이로 제한)
-            pct_columns = [col for col in metrics_df.columns if 'percent' in col or 'utilization' in col]
+            pct_columns = [col for col in metrics_df.columns if 'percent' in col or 'utilization' in col or 'usage' in col]
             for col in pct_columns:
                 metrics_df[col] = metrics_df[col].clip(0, 100)
             
@@ -331,15 +397,36 @@ class DataPreprocessor:
             logger.error(f"자원 지표 계산 중 오류 발생: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            return pd.DataFrame()
+            # 최소한의 결과 반환 시도
+            try:
+                # 메타데이터만이라도 포함하는 빈 결과 반환
+                min_result = pd.DataFrame(index=df.index)
+                for col in ['device_id', 'companyDomain', 'building', 'location', 'origin']:
+                    if col in df.columns:
+                        min_result[col] = df[col].iloc[0] if len(df) > 0 else None
+                
+                # value 값이 있으면 추가
+                if 'value' in df.columns:
+                    min_result['value'] = df['value']
+                elif '_value' in df.columns:
+                    min_result['value'] = df['_value']
+                
+                if 'location' in df.columns:
+                    loc = df['location'].iloc[0] if len(df) > 0 else 'unknown'
+                    min_result[f'{loc}_value'] = df['value'] if 'value' in df.columns else df['_value'] if '_value' in df.columns else 0
+                
+                return min_result
+            except:
+                return pd.DataFrame()
     
-    def process_resource_data(self, df, location):
+    def process_resource_data(self, df, location, incremental=True):
         """
-        자원별 데이터 처리
+        자원별 데이터 처리 (개선됨)
         
         Args:
             df (pd.DataFrame): 데이터프레임
             location (str): 자원 위치
+            incremental (bool): 증분 처리 여부
             
         Returns:
             pd.DataFrame: 처리된 자원 지표 데이터프레임
@@ -350,6 +437,58 @@ class DataPreprocessor:
         
         try:
             logger.info(f"'{location}' 자원 데이터 처리 시작 ({len(df)}행)")
+            
+            # 기존 데이터 로드 (증분 처리용)
+            existing_data = None
+            if incremental and self.result_handler:
+                # 최근 처리된 데이터 로드 (마지막 30분)
+                end_time = datetime.now()
+                start_time = end_time - timedelta(minutes=30)
+                
+                # EAV 모델 사용 여부 확인
+                use_eav_model = self.config.get("database", {}).get("use_eav_model", False)
+                
+                if use_eav_model:
+                    # 자원 메트릭 테이블에서 로드
+                    existing_data = self.result_handler.load_resource_metrics(
+                        resource_type=location,
+                        start_time=start_time,
+                        end_time=end_time
+                    )
+                else:
+                    # 기존 테이블에서 로드
+                    filter_cond = None
+                    if location == 'cpu':
+                        filter_cond = "cpu_usage IS NOT NULL"
+                    elif location == 'mem':
+                        filter_cond = "memory_used_percent IS NOT NULL"
+                    elif location == 'disk':
+                        filter_cond = "disk_used_percent IS NOT NULL"
+                    elif location == 'diskio':
+                        filter_cond = "disk_io_utilization IS NOT NULL"
+                    elif location == 'net':
+                        filter_cond = "net_utilization IS NOT NULL"
+                    elif location == 'system':
+                        filter_cond = "system_load1 IS NOT NULL"
+                    
+                    existing_data = self.result_handler.load_from_mysql(
+                        table_name="processed_resource_data",
+                        start_time=start_time,
+                        end_time=end_time,
+                        filter_cond=filter_cond
+                    )
+            
+            # 중복 제거 (기존 데이터와 겹치는 부분 제외)
+            if existing_data is not None and not existing_data.empty and isinstance(df.index, pd.DatetimeIndex):
+                # 이미 처리된 타임스탬프 찾기
+                processed_times = set(existing_data.index)
+                
+                # 새 데이터에서 중복 제외
+                df = df[~df.index.isin(processed_times)]
+                
+                if df.empty:
+                    logger.info(f"증분 처리: 새로운 데이터가 없습니다. ({location})")
+                    return pd.DataFrame()
             
             # 1. 일관된 시간 간격으로 리샘플링
             resample_freq = self.config.get('advanced', {}).get('resampling', {}).get('freq', '5min')
@@ -362,8 +501,8 @@ class DataPreprocessor:
             
             # 3. 이상치 처리
             if self.config.get('advanced', {}).get('outliers', {}).get('handle_outliers', True):
-                method = self.config.get('advanced', {}).get('outliers', {}).get('method', 'zscore')
-                threshold = self.config.get('advanced', {}).get('outliers', {}).get('threshold', 3.0)
+                method = self.config.get('advanced', {}).get('outliers', {}).get('method', 'iqr')
+                threshold = self.config.get('advanced', {}).get('outliers', {}).get('threshold', 2.0)
                 df = self.handle_outliers(df, method=method, threshold=threshold)
             
             # 4. 자원 지표 계산
@@ -451,7 +590,7 @@ class DataPreprocessor:
     
     def create_sequence_dataset(self, df, target_cols, input_window=24, pred_horizon=1):
         """
-        시계열 시퀀스 데이터셋 생성
+        시계열 시퀀스 데이터셋 생성 (개선됨)
         
         Args:
             df (pd.DataFrame): 데이터프레임
@@ -464,6 +603,11 @@ class DataPreprocessor:
         """
         if df is None or df.empty:
             logger.warning("시퀀스 생성을 위한 데이터가 비어 있습니다.")
+            return None, None, None
+        
+        # 데이터가 충분한지 확인 (개선)
+        if len(df) < input_window + pred_horizon:
+            logger.warning(f"데이터가 충분하지 않습니다. 필요: {input_window + pred_horizon}, 실제: {len(df)}")
             return None, None, None
         
         # 타겟 열이 데이터프레임에 있는지 확인
@@ -502,7 +646,13 @@ class DataPreprocessor:
                 logger.warning("생성된 시퀀스가 없습니다.")
                 return None, None, None
             
-            return np.array(X), np.array(y), y_timestamps
+            # 데이터 형태 검증 (개선)
+            X_array = np.array(X)
+            y_array = np.array(y)
+            
+            logger.info(f"시퀀스 데이터셋 생성 완료: X 형태={X_array.shape}, y 형태={y_array.shape}")
+            
+            return X_array, y_array, y_timestamps
             
         except Exception as e:
             logger.error(f"시퀀스 데이터셋 생성 중 오류 발생: {e}")
@@ -512,7 +662,7 @@ class DataPreprocessor:
     
     def create_classification_dataset(self, df, target_col, threshold=None, input_window=24):
         """
-        분류를 위한 시퀀스 데이터셋 생성
+        분류를 위한 시퀀스 데이터셋 생성 (개선됨)
         
         Args:
             df (pd.DataFrame): 데이터프레임
@@ -525,6 +675,11 @@ class DataPreprocessor:
         """
         if df is None or df.empty:
             logger.warning("분류 데이터셋 생성을 위한 데이터가 비어 있습니다.")
+            return None, None, None
+        
+        # 데이터가 충분한지 확인 (개선)
+        if len(df) <= input_window:
+            logger.warning(f"데이터가 충분하지 않습니다. 필요: {input_window+1}+, 실제: {len(df)}")
             return None, None, None
         
         if target_col not in df.columns:
@@ -560,11 +715,17 @@ class DataPreprocessor:
                 logger.warning("생성된 분류 데이터셋이 없습니다.")
                 return None, None, None
             
+            # 데이터 배열로 변환 및 차원 검증 (개선)
+            X_array = np.array(X)
+            y_array = np.array(y)
+            
+            logger.info(f"분류 데이터셋 생성 완료: X 형태={X_array.shape}, y 형태={y_array.shape}")
+            
             # 클래스 불균형 확인
             pos_ratio = np.mean(y)
             logger.info(f"클래스 비율 - 음성(0): {1-pos_ratio:.2f}, 양성(1): {pos_ratio:.2f}")
             
-            return np.array(X), np.array(y), y_timestamps
+            return X_array, y_array, y_timestamps
             
         except Exception as e:
             logger.error(f"분류 데이터셋 생성 중 오류 발생: {e}")
