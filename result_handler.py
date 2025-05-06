@@ -458,7 +458,7 @@ class ResultHandler:
     
     def save_resource_metrics(self, df, resource_type):
         """
-        자원 메트릭을 EAV 모델 형식으로 MySQL에 저장
+        자원 메트릭을 EAV 모델 형식으로 MySQL에 저장 (중복 검사 추가)
         
         Args:
             df (pd.DataFrame): 자원 데이터프레임
@@ -477,13 +477,10 @@ class ResultHandler:
         building = df['building'].iloc[0] if 'building' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('building', 'gyeongnam_campus')
         
         try:
-            conn = mysql.connector.connect(
-                host=self.mysql_config.get('host'),
-                port=self.mysql_config.get('port'),
-                user=self.mysql_config.get('user'),
-                password=self.mysql_config.get('password'),
-                database=self.mysql_config.get('database')
-            )
+            # MySQL 연결 생성
+            conn = self.mysql_connect()
+            if not conn:
+                return False
             
             cursor = conn.cursor()
             
@@ -493,6 +490,9 @@ class ResultHandler:
             # 인덱스가 DatetimeIndex인 경우 열로 변환
             if isinstance(df.index, pd.DatetimeIndex):
                 df = df.reset_index().rename(columns={'index': 'timestamp'})
+            
+            # 중복 검사를 위한 기존 데이터 조회 (배치로 처리)
+            existing_records = {}
             
             # 각 지표별로 EAV 형식으로 변환
             for idx, row in df.iterrows():
@@ -511,29 +511,79 @@ class ResultHandler:
                     elif 'rate' in col:
                         unit = '/s'
                     
+                    # 값 검증 - NaN, inf 제외
+                    value = row[col]
+                    if pd.isna(value) or np.isinf(value):
+                        value = 0
+                    
                     # 레코드 추가
                     records.append((
                         timestamp,
                         device_id,
                         resource_type,
                         col,
-                        float(row[col]),
+                        float(value),
                         unit,
                         company_domain,
                         building
                     ))
             
-            # 일괄 삽입
+            # 중복 체크 (최대 100개씩 배치로)
+            batch_size = 100
+            checked_records = []
+            
+            for i in range(0, len(records), batch_size):
+                batch = records[i:i+batch_size]
+                
+                # 중복 확인할 조건 생성
+                conditions = []
+                params = []
+                
+                for record in batch:
+                    timestamp, device_id, resource_type, metric_name = record[:4]
+                    conditions.append(f"(timestamp = %s AND device_id = %s AND resource_type = %s AND metric_name = %s)")
+                    params.extend([timestamp, device_id, resource_type, metric_name])
+                
+                if conditions:
+                    query = f"""
+                    SELECT timestamp, device_id, resource_type, metric_name FROM resource_metrics 
+                    WHERE {" OR ".join(conditions)}
+                    """
+                    
+                    cursor.execute(query, params)
+                    results = cursor.fetchall()
+                    
+                    # 존재하는 데이터 캐싱
+                    for result in results:
+                        key = (result[0], result[1], result[2], result[3])  # (timestamp, device_id, resource_type, metric_name)
+                        existing_records[key] = True
+            
+            # 중복이 아닌 레코드만 필터링
+            unique_records = []
+            for record in records:
+                key = (record[0], record[1], record[2], record[3])  # (timestamp, device_id, resource_type, metric_name)
+                if key not in existing_records:
+                    unique_records.append(record)
+                    # 이후 중복 검사를 위해 캐시에 추가
+                    existing_records[key] = True
+            
+            # UPSERT 쿼리 (중복이 있는 경우 업데이트)
             query = """
             INSERT INTO resource_metrics 
             (timestamp, device_id, resource_type, metric_name, metric_value, unit, companyDomain, building)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE 
+            metric_value = VALUES(metric_value),
+            unit = VALUES(unit)
             """
             
-            cursor.executemany(query, records)
-            conn.commit()
-            
-            logger.info(f"{len(records)}개의 자원 메트릭이 저장되었습니다. (자원: {resource_type})")
+            if unique_records:
+                cursor.executemany(query, unique_records)
+                conn.commit()
+                
+                logger.info(f"{len(unique_records)}개의 자원 메트릭이 저장되었습니다. (자원: {resource_type}, 중복 제외: {len(records) - len(unique_records)}개)")
+            else:
+                logger.info(f"저장할 새로운 자원 메트릭이 없습니다. (모두 중복: {len(records)}개)")
             
             # 마지막 수집 시간 업데이트
             self.update_last_collection_time(resource_type, device_id, company_domain, building)
@@ -1859,97 +1909,3 @@ class ResultHandler:
             import traceback
             logger.error(traceback.format_exc())
             return None
-
-    def save_resource_metrics(self, df, resource_type):
-        """
-        자원 메트릭을 EAV 모델 형식으로 MySQL에 저장
-        
-        Args:
-            df (pd.DataFrame): 자원 데이터프레임
-            resource_type (str): 자원 유형 (cpu, mem, disk, diskio, net, system)
-            
-        Returns:
-            bool: 성공 여부
-        """
-        if df is None or df.empty:
-            logger.warning("저장할 자원 메트릭 데이터가 비어 있습니다.")
-            return False
-        
-        # 기본 메타데이터 추출
-        device_id = df['device_id'].iloc[0] if 'device_id' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('device_id', 'device_001')
-        company_domain = df['companyDomain'].iloc[0] if 'companyDomain' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('companyDomain', 'javame')
-        building = df['building'].iloc[0] if 'building' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('building', 'gyeongnam_campus')
-        
-        try:
-            # MySQL 연결 생성
-            conn = self.mysql_connect()
-            if not conn:
-                return False
-            
-            cursor = conn.cursor()
-            
-            # 데이터 변환 및 삽입
-            records = []
-            
-            # 인덱스가 DatetimeIndex인 경우 열로 변환
-            if isinstance(df.index, pd.DatetimeIndex):
-                df = df.reset_index().rename(columns={'index': 'timestamp'})
-            
-            # 각 지표별로 EAV 형식으로 변환
-            for idx, row in df.iterrows():
-                timestamp = row['timestamp'] if 'timestamp' in df.columns else datetime.now()
-                
-                # 숫자형 열만 사용
-                for col in df.select_dtypes(include=[np.number]).columns:
-                    # 메타데이터 열은 건너뜀
-                    if col in ['id', 'device_id', 'companyDomain', 'building'] or 'timestamp' in col.lower():
-                        continue
-                    
-                    # 단위 결정
-                    unit = '%' if 'percent' in col or 'usage' in col else ''
-                    if 'bytes' in col:
-                        unit = 'bytes/s'
-                    elif 'rate' in col:
-                        unit = '/s'
-                    
-                    # 값 검증 - NaN, inf 제외
-                    value = row[col]
-                    if pd.isna(value) or np.isinf(value):
-                        value = 0
-                    
-                    # 레코드 추가
-                    records.append((
-                        timestamp,
-                        device_id,
-                        resource_type,
-                        col,
-                        float(value),
-                        unit,
-                        company_domain,
-                        building
-                    ))
-            
-            # 일괄 삽입
-            query = """
-            INSERT INTO resource_metrics 
-            (timestamp, device_id, resource_type, metric_name, metric_value, unit, companyDomain, building)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """
-            
-            cursor.executemany(query, records)
-            conn.commit()
-            
-            logger.info(f"{len(records)}개의 자원 메트릭이 저장되었습니다. (자원: {resource_type})")
-            
-            # 마지막 수집 시간 업데이트
-            self.update_last_collection_time(resource_type, device_id, company_domain, building)
-            
-            cursor.close()
-            conn.close()
-            return True
-            
-        except Exception as e:
-            logger.error(f"자원 메트릭 저장 실패: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return False

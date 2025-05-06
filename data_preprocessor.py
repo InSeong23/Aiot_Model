@@ -68,7 +68,7 @@ class DataPreprocessor:
         
         # 설정에서 리샘플링 주기 가져오기 (기본값: 1시간)
         if freq is None:
-            freq = self.config.get('advanced', {}).get('resampling', {}).get('freq', '1H')
+            freq = self.config.get('advanced', {}).get('resampling', {}).get('freq', '1h')
             logger.info(f"리샘플링 주기: {freq}")
         
         if not isinstance(df.index, pd.DatetimeIndex):
@@ -421,7 +421,7 @@ class DataPreprocessor:
     
     def process_resource_data(self, df, location, incremental=True):
         """
-        자원별 데이터 처리 (개선됨)
+        자원별 데이터 처리 (중복 처리 로직 개선)
         
         Args:
             df (pd.DataFrame): 데이터프레임
@@ -440,6 +440,8 @@ class DataPreprocessor:
             
             # 기존 데이터 로드 (증분 처리용)
             existing_data = None
+            existing_keys = set()  # (timestamp, device_id, metric_name) 튜플 저장
+            
             if incremental and self.result_handler:
                 # 최근 처리된 데이터 로드 (마지막 30분)
                 end_time = datetime.now()
@@ -477,18 +479,100 @@ class DataPreprocessor:
                         end_time=end_time,
                         filter_cond=filter_cond
                     )
+                
+                # 기존 데이터에서 고유 키 추출 (timestamp, device_id, metric_name)
+                if existing_data is not None and not existing_data.empty:
+                    # device_id 확인
+                    device_id_col = 'device_id' if 'device_id' in existing_data.columns else None
+                    
+                    # 각 열에 대해 고유 키 생성
+                    for col in existing_data.select_dtypes(include=[np.number]).columns:
+                        # 메타데이터 열은 건너뜀
+                        if col in ['id', 'device_id', 'companyDomain', 'building'] or 'timestamp' in col.lower():
+                            continue
+                        
+                        # 타임스탬프가 인덱스인 경우
+                        if isinstance(existing_data.index, pd.DatetimeIndex):
+                            for idx, row in existing_data.iterrows():
+                                device_id = row[device_id_col] if device_id_col else "unknown"
+                                # (timestamp, device_id, metric_name) 튜플 추가
+                                existing_keys.add((idx, device_id, col))
+                        else:
+                            # 타임스탬프가 열인 경우
+                            timestamp_col = next((col for col in existing_data.columns if 'timestamp' in col.lower()), None)
+                            if timestamp_col:
+                                for idx, row in existing_data.iterrows():
+                                    device_id = row[device_id_col] if device_id_col else "unknown"
+                                    timestamp = row[timestamp_col]
+                                    # (timestamp, device_id, metric_name) 튜플 추가
+                                    existing_keys.add((timestamp, device_id, col))
             
             # 중복 제거 (기존 데이터와 겹치는 부분 제외)
-            if existing_data is not None and not existing_data.empty and isinstance(df.index, pd.DatetimeIndex):
-                # 이미 처리된 타임스탬프 찾기
-                processed_times = set(existing_data.index)
+            if existing_keys:
+                # 새 데이터에서 중복 아닌 행만 필터링
+                filtered_rows = []
                 
-                # 새 데이터에서 중복 제외
-                df = df[~df.index.isin(processed_times)]
+                # device_id 확인
+                device_id_col = 'device_id' if 'device_id' in df.columns else None
+                device_id_default = self.config.get('data_processing', {}).get('default_values', {}).get('device_id', 'device_001')
                 
-                if df.empty:
-                    logger.info(f"증분 처리: 새로운 데이터가 없습니다. ({location})")
-                    return pd.DataFrame()
+                # 타임스탬프가 인덱스인 경우
+                if isinstance(df.index, pd.DatetimeIndex):
+                    for idx, row in df.iterrows():
+                        device_id = row[device_id_col] if device_id_col else device_id_default
+                        # 이 행의 모든 측정값에 대해 중복 체크
+                        duplicate = False
+                        
+                        for col in df.select_dtypes(include=[np.number]).columns:
+                            # 메타데이터 열은 건너뜀
+                            if col in ['id', 'device_id', 'companyDomain', 'building'] or 'timestamp' in col.lower():
+                                continue
+                            
+                            # 고유 키 확인
+                            if (idx, device_id, col) in existing_keys:
+                                duplicate = True
+                                break
+                        
+                        # 중복이 아니면 추가
+                        if not duplicate:
+                            filtered_rows.append(idx)
+                    
+                    # 필터링된 행으로 새 데이터프레임 생성
+                    if filtered_rows:
+                        df = df.loc[filtered_rows]
+                    else:
+                        logger.info(f"증분 처리: 새로운 데이터가 없습니다. ({location})")
+                        return pd.DataFrame()
+                else:
+                    # 타임스탬프가 열인 경우
+                    timestamp_col = next((col for col in df.columns if 'timestamp' in col.lower()), None)
+                    if timestamp_col:
+                        for idx, row in df.iterrows():
+                            device_id = row[device_id_col] if device_id_col else device_id_default
+                            timestamp = row[timestamp_col]
+                            # 이 행의 모든 측정값에 대해 중복 체크
+                            duplicate = False
+                            
+                            for col in df.select_dtypes(include=[np.number]).columns:
+                                # 메타데이터 열은 건너뜀
+                                if col in ['id', 'device_id', 'companyDomain', 'building'] or 'timestamp' in col.lower():
+                                    continue
+                                
+                                # 고유 키 확인
+                                if (timestamp, device_id, col) in existing_keys:
+                                    duplicate = True
+                                    break
+                            
+                            # 중복이 아니면 추가
+                            if not duplicate:
+                                filtered_rows.append(idx)
+                        
+                        # 필터링된 행으로 새 데이터프레임 생성
+                        if filtered_rows:
+                            df = df.loc[filtered_rows]
+                        else:
+                            logger.info(f"증분 처리: 새로운 데이터가 없습니다. ({location})")
+                            return pd.DataFrame()
             
             # 1. 일관된 시간 간격으로 리샘플링
             resample_freq = self.config.get('advanced', {}).get('resampling', {}).get('freq', '5min')
