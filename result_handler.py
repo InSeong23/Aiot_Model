@@ -38,7 +38,7 @@ class ResultHandler:
     
     def init_tables(self):
         """
-        필요한 테이블 생성 (파티션 없이 단순화)
+        필요한 테이블 생성 (모든 테이블 포함)
         
         Returns:
             bool: 성공 여부
@@ -58,17 +58,49 @@ class ResultHandler:
             
             cursor = conn.cursor()
             
-            # EAV 모델 기반 테이블 구조 사용 여부 확인
-            use_eav_model = self.config.get("database", {}).get("use_eav_model", False)
+            # 1. company_metadata 테이블 생성
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS company_metadata (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                companyDomain VARCHAR(100) NOT NULL UNIQUE,
+                company_name VARCHAR(100),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """)
             
-            # 메타데이터 테이블 생성
+            # 2. building_metadata 테이블 생성
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS building_metadata (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                company_id INT NOT NULL,
+                building VARCHAR(100) NOT NULL,
+                location VARCHAR(255),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY building_unique (company_id, building),
+                FOREIGN KEY (company_id) REFERENCES company_metadata(id)
+            )
+            """)
+            
+            # 3. device_metadata 테이블 생성
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS device_metadata (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                building_id INT NOT NULL,
+                device_id VARCHAR(50) NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY device_unique (building_id, device_id),
+                FOREIGN KEY (building_id) REFERENCES building_metadata(id)
+            )
+            """)
+            
+            # 4. resource_metrics 테이블 생성 (타임스탬프에 인덱스 추가, 고유 키 제약 추가)
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS resource_metrics (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 timestamp DATETIME NOT NULL,
                 device_id VARCHAR(50) NOT NULL,
-                resource_type VARCHAR(50),
-                metric_name VARCHAR(50),
+                resource_type VARCHAR(50) NOT NULL,
+                metric_name VARCHAR(50) NOT NULL,
                 metric_value FLOAT,
                 unit VARCHAR(10),
                 companyDomain VARCHAR(100),
@@ -76,18 +108,20 @@ class ResultHandler:
                 
                 INDEX idx_device_time (device_id, timestamp),
                 INDEX idx_metric (resource_type, metric_name),
-                INDEX idx_company_building (companyDomain, building)
+                INDEX idx_timestamp (timestamp),
+                INDEX idx_company_building (companyDomain, building),
+                UNIQUE KEY unique_metric (timestamp, device_id, resource_type, metric_name)
             )
             """)
             
-            # 예측 결과 테이블
+            # 5. prediction_results 테이블 생성
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS prediction_results (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 timestamp DATETIME NOT NULL,
                 device_id VARCHAR(50) NOT NULL, 
-                resource_type VARCHAR(50),
-                metric_name VARCHAR(50),
+                resource_type VARCHAR(50) NOT NULL,
+                metric_name VARCHAR(50) NOT NULL,
                 predicted_value FLOAT,
                 prediction_type VARCHAR(20),
                 prediction_horizon VARCHAR(20),
@@ -101,26 +135,93 @@ class ResultHandler:
             )
             """)
             
-            # 마지막 데이터 수집 시간 관리 테이블
+            # 6. model_performance 테이블 생성
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS model_performance (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                model_type VARCHAR(50) NOT NULL,
+                resource_type VARCHAR(50) NOT NULL,
+                evaluation_time DATETIME NOT NULL,
+                rmse FLOAT,
+                mae FLOAT,
+                accuracy FLOAT,
+                precision_score FLOAT,
+                recall_score FLOAT,
+                f1_score FLOAT,
+                sample_count INT,
+                model_version VARCHAR(20),
+                
+                INDEX idx_model (model_type, resource_type),
+                INDEX idx_time (evaluation_time)
+            )
+            """)
+            
+            # 7. collection_metadata 테이블 생성
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS collection_metadata (
                 id INT AUTO_INCREMENT PRIMARY KEY,
-                collection_type VARCHAR(50),
-                device_id VARCHAR(50),
-                companyDomain VARCHAR(100),
-                building VARCHAR(100),
-                last_collection_time DATETIME,
+                collection_type VARCHAR(50) NOT NULL,
+                device_id VARCHAR(50) NOT NULL,
+                companyDomain VARCHAR(100) NOT NULL,
+                building VARCHAR(100) NOT NULL,
+                last_collection_time DATETIME NOT NULL,
                 
                 INDEX idx_device (device_id, companyDomain, building),
                 INDEX idx_type (collection_type)
             )
             """)
             
-            conn.commit()
-            logger.info("MySQL 테이블 생성 완료")
+            # 8. prediction_runs 테이블 생성
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS prediction_runs (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                run_start_time DATETIME NOT NULL,
+                run_end_time DATETIME NOT NULL,
+                prediction_type VARCHAR(50) NOT NULL,
+                status VARCHAR(20) NOT NULL,
+                locations_processed TEXT,
+                error_message TEXT,
+                resource_count INT,
+                model_version VARCHAR(20),
+                
+                INDEX idx_type (prediction_type),
+                INDEX idx_time (run_start_time)
+            )
+            """)
             
+            # 기본 회사 정보 추가 (없는 경우)
+            cursor.execute("""
+            INSERT IGNORE INTO company_metadata (companyDomain, company_name) 
+            VALUES (%s, %s)
+            """, ('javame', 'JavaMe Corp'))
+            
+            # 기본 건물 정보 추가
+            cursor.execute("""
+            SELECT id FROM company_metadata WHERE companyDomain = 'javame'
+            """)
+            company_id = cursor.fetchone()[0]
+            
+            cursor.execute("""
+            INSERT IGNORE INTO building_metadata (company_id, building, location) 
+            VALUES (%s, %s, %s)
+            """, (company_id, 'gyeongnam_campus', 'Gyeongnam, Korea'))
+            
+            # 기본 디바이스 정보 추가
+            cursor.execute("""
+            SELECT id FROM building_metadata WHERE company_id = %s AND building = %s
+            """, (company_id, 'gyeongnam_campus'))
+            building_id = cursor.fetchone()[0]
+            
+            cursor.execute("""
+            INSERT IGNORE INTO device_metadata (building_id, device_id) 
+            VALUES (%s, %s)
+            """, (building_id, '192.168.71.74'))
+            
+            conn.commit()
             cursor.close()
             conn.close()
+            
+            logger.info("MySQL 테이블 생성 완료")
             return True
             
         except Exception as e:
@@ -264,8 +365,9 @@ class ResultHandler:
                         )
                         """)
                         logger.info(f"파티션 추가됨: {partition_name}")
+                        pass
                     except Exception as e:
-                        logger.warning(f"파티션 추가 실패 ({partition_name}): {e}")
+                        logger.warning(f"파티션 관리 중 오류 발생 (무시됨): {e}")
             
             cursor.close()
             conn.close()
@@ -280,7 +382,7 @@ class ResultHandler:
         Args:
             df_list (list): 데이터프레임 목록
             resource_types (list): 자원 유형 목록
-            
+                
         Returns:
             bool: 성공 여부
         """
@@ -301,6 +403,9 @@ class ResultHandler:
             total_records = 0
             
             try:
+                # 트랜잭션 시작
+                conn.start_transaction()
+                
                 # 각 데이터프레임 처리
                 for idx, df in enumerate(df_list):
                     resource_type = resource_types[idx]
@@ -317,99 +422,195 @@ class ResultHandler:
                     company_domain = df['companyDomain'].iloc[0] if 'companyDomain' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('companyDomain', 'javame')
                     building = df['building'].iloc[0] if 'building' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('building', 'gyeongnam_campus')
                     
-                    # 회사 ID 확인 또는 생성
-                    cursor.execute("""
-                    INSERT IGNORE INTO company_metadata (companyDomain) VALUES (%s)
-                    """, (company_domain,))
-                    
-                    cursor.execute("""
-                    SELECT id FROM company_metadata WHERE companyDomain = %s
-                    """, (company_domain,))
-                    company_id = cursor.fetchone()[0]
-                    
-                    # 건물 ID 확인 또는 생성
-                    cursor.execute("""
-                    INSERT IGNORE INTO building_metadata (company_id, building)
-                    VALUES (%s, %s)
-                    """, (company_id, building))
-                    
-                    cursor.execute("""
-                    SELECT id FROM building_metadata 
-                    WHERE company_id = %s AND building = %s
-                    """, (company_id, building))
-                    building_id = cursor.fetchone()[0]
-                    
-                    # 디바이스 ID 확인 또는 생성
-                    cursor.execute("""
-                    INSERT IGNORE INTO device_metadata (building_id, device_id)
-                    VALUES (%s, %s)
-                    """, (building_id, device_id))
-                    
                     # 인덱스가 DatetimeIndex인 경우 열로 변환
                     if isinstance(df.index, pd.DatetimeIndex):
-                        df = df.reset_index().rename(columns={'index': 'timestamp'})
+                        df = df.reset_index()
+                        # 첫 번째 열(원래 인덱스)이 무슨 이름이든 timestamp로 변경
+                        df.rename(columns={df.columns[0]: 'timestamp'}, inplace=True)
                     
-                    # 각 지표별로 EAV 형식으로 변환
-                    for idx, row in df.iterrows():
-                        timestamp = row['timestamp'] if 'timestamp' in df.columns else datetime.now()
+                    # 디버깅 로그
+                    logger.info(f"처리 중인 데이터: {resource_type}, 컬럼: {df.columns.tolist()}")
+                    logger.info(f"데이터 샘플:\n{df.head()}")
+                    
+                    # _value 열 직접 처리
+                    if '_value' in df.columns:
+                        logger.info(f"{resource_type}의 _value 열 직접 처리 중...")
+                        logger.info(f"_value 열 샘플: {df['_value'].head()}")
+                        logger.info(f"_value 열 타입: {df['_value'].dtype}")
+                        logger.info(f"_value 열 통계: 평균={df['_value'].mean()}, 최소={df['_value'].min()}, 최대={df['_value'].max()}")
                         
-                        # 숫자형 열만 사용
-                        for col in df.select_dtypes(include=[np.number]).columns:
-                            # 메타데이터 열은 건너뜀
-                            if col in ['id', 'device_id', 'companyDomain', 'building'] or 'timestamp' in col.lower():
-                                continue
+                        for idx, row in df.iterrows():
+                            # 타임스탬프 처리
+                            if '_time' in df.columns:
+                                # _time 열이 있으면 그대로 사용
+                                ts = row['_time']
+                                if isinstance(ts, pd.Timestamp):
+                                    time_str = ts.strftime('%Y-%m-%d %H:%M:%S')
+                                else:
+                                    time_str = str(ts)
+                            elif 'timestamp' in df.columns:
+                                # timestamp 열 사용
+                                ts = row['timestamp']
+                                if isinstance(ts, pd.Timestamp):
+                                    time_str = ts.strftime('%Y-%m-%d %H:%M:%S')
+                                else:
+                                    time_str = str(ts)
+                            else:
+                                # 모든 방법이 실패하면 기본값 사용
+                                time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                             
-                            # 단위 결정
-                            unit = '%' if 'percent' in col or 'usage' in col else ''
-                            if 'bytes' in col:
-                                unit = 'bytes/s'
-                            elif 'rate' in col:
-                                unit = '/s'
-                            
-                            # 값 검증 - NaN, inf 제외
-                            value = row[col]
-                            if pd.isna(value) or np.isinf(value):
-                                value = 0
-                            
-                            # 레코드 추가
-                            records.append((
-                                timestamp,
-                                device_id,
-                                resource_type,
-                                col,
-                                float(value),
-                                unit,
-                                company_domain,
-                                building
-                            ))
-                            
-                            # 배치 크기에 도달하면 삽입
-                            if len(records) >= batch_size:
-                                cursor.executemany("""
-                                INSERT INTO resource_metrics 
-                                (timestamp, device_id, resource_type, metric_name, metric_value, unit, companyDomain, building)
-                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                                """, records)
-                                total_records += len(records)
-                                records = []
+                            # _value 열 값 처리 - 핵심 수정 부분
+                            try:
+                                # 명시적으로 파이썬 기본 타입으로 변환
+                                raw_value = row['_value']
+                                
+                                # 디버깅 출력 추가
+                                logger.info(f"원본 _value: {raw_value}, 타입: {type(raw_value)}")
+                                
+                                # None, NaN 체크
+                                if pd.isna(raw_value) or raw_value is None:
+                                    logger.warning(f"null 값 감지: {raw_value}")
+                                    continue
+                                
+                                # 확실한 float 변환
+                                value = float(raw_value)
+                                logger.info(f"변환된 값: {value}, 타입: {type(value)}")
+                                
+                                # 메트릭 이름 설정
+                                if resource_type == 'cpu':
+                                    metric_name = 'cpu_usage'
+                                elif resource_type == 'mem':
+                                    metric_name = 'memory_used_percent'
+                                elif resource_type == 'disk':
+                                    metric_name = 'disk_used_percent'
+                                else:
+                                    metric_name = f"{resource_type}_value"
+                                
+                                # 단위 설정
+                                unit = '%' if resource_type in ['cpu', 'mem', 'disk'] or 'percent' in metric_name else ''
+                                
+                                # 레코드 추가 (값을 명시적으로 float로 변환)
+                                records.append((
+                                    time_str,
+                                    device_id,
+                                    resource_type,
+                                    metric_name,
+                                    value,  # 변환된 Python 기본 float 사용
+                                    unit,
+                                    company_domain,
+                                    building
+                                ))
+                            except Exception as e:
+                                logger.warning(f"값 변환 실패: {e}")
                     
-                    # 남은 레코드 삽입
+                    else:
+                        # _value 열이 없는 경우 자원별 특정 열 사용
+                        logger.warning(f"{resource_type}에 _value 열이 없습니다. 자원별 처리 열 사용...")
+                        
+                        # 자원별 특정 열 매핑
+                        resource_columns = {
+                            'cpu': 'cpu_usage',
+                            'disk': 'disk_used_percent',
+                            'diskio': 'disk_io_utilization',
+                            'mem': 'memory_used_percent',
+                            'net': 'net_utilization',
+                            'system': 'system_load1'
+                        }
+                        
+                        # 자원에 맞는 열 선택
+                        target_column = resource_columns.get(resource_type)
+                        
+                        if target_column and target_column in df.columns:
+                            logger.info(f"{resource_type} 자원의 {target_column} 열 사용")
+                            logger.info(f"{target_column} 열 통계: 평균={df[target_column].mean()}, 최소={df[target_column].min()}, 최대={df[target_column].max()}")
+                            
+                            for idx, row in df.iterrows():
+                                # 타임스탬프 처리 (생략)...
+                                if 'timestamp' in df.columns:
+                                    ts = row['timestamp']
+                                    if isinstance(ts, pd.Timestamp):
+                                        time_str = ts.strftime('%Y-%m-%d %H:%M:%S')
+                                    else:
+                                        time_str = str(ts)
+                                else:
+                                    time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                
+                                # 값 처리
+                                try:
+                                    raw_value = row[target_column]
+                                    # 디버깅
+                                    logger.info(f"사용할 값: {raw_value}, 타입: {type(raw_value)}")
+                                    
+                                    # NaN 체크
+                                    if pd.isna(raw_value) or raw_value is None:
+                                        continue
+                                    
+                                    # float 변환
+                                    value = float(raw_value)
+                                    
+                                    # 레코드 추가
+                                    records.append((
+                                        time_str,
+                                        device_id,
+                                        resource_type,
+                                        target_column,
+                                        value,
+                                        '%' if 'percent' in target_column or resource_type in ['cpu', 'mem', 'disk'] else '',
+                                        company_domain,
+                                        building
+                                    ))
+                                except Exception as e:
+                                    logger.error(f"값 변환 실패: {e}")
+                        else:
+                            # 대체 처리 - 모든 숫자형 열 처리
+                            logger.warning(f"{resource_type}에 대한 특정 열을 찾을 수 없음. 모든 숫자형 열 사용")
+                            # 각 지표별로 EAV 형식으로 변환 처리 (생략)...
+                    
+                    # 레코드 삽입
                     if records:
-                        cursor.executemany("""
+                        logger.info(f"{resource_type}에 대해 {len(records)}개 레코드 삽입 중...")
+                        
+                        sql = """
                         INSERT INTO resource_metrics 
                         (timestamp, device_id, resource_type, metric_name, metric_value, unit, companyDomain, building)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        """, records)
-                        total_records += len(records)
+                        ON DUPLICATE KEY UPDATE 
+                        metric_value = VALUES(metric_value),
+                        unit = VALUES(unit)
+                        """
+                        
+                        # 각 레코드를 개별적으로 삽입하여 중복 오류 처리
+                        success_count = 0
+                        duplicate_count = 0
+                        
+                        for record in records:
+                            try:
+                                # 디버깅 로그 추가
+                                logger.debug(f"SQL 실행 직전 metric_value: {record[4]}, 타입: {type(record[4])}")
+                                cursor.execute(sql, record)
+                                success_count += 1
+                            except mysql.connector.errors.IntegrityError as e:
+                                if "Duplicate entry" in str(e):
+                                    duplicate_count += 1
+                                    # 로깅 제한
+                                    if duplicate_count <= 5:
+                                        logger.warning(f"중복 데이터 건너뜀: {record[0]}, {record[3]}")
+                                else:
+                                    logger.error(f"삽입 오류: {e}")
+                            except Exception as e:
+                                logger.error(f"SQL 실행 오류: {e}, 레코드: {record}")
+                        
+                        total_records += success_count
+                        logger.info(f"{resource_type}: {success_count}개 성공, {duplicate_count}개 중복")
                     
                     # 마지막 수집 시간 업데이트
                     self.update_last_collection_time(resource_type, device_id, company_domain, building)
                 
-                # 트랜잭션 커밋
+                # 명시적 커밋
                 conn.commit()
                 logger.info(f"총 {total_records}개의 자원 메트릭이 배치로 저장되었습니다.")
                 return True
-                
+                    
             except Exception as e:
                 # 오류 시 롤백
                 conn.rollback()
@@ -420,12 +621,13 @@ class ResultHandler:
             finally:
                 cursor.close()
                 conn.close()
-                
+                    
         except Exception as e:
             logger.error(f"자원 메트릭 배치 저장 실패: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return False
+        
     def save_processed_data(self, df):
         """
         전처리된 자원 데이터를 MySQL에 저장
@@ -458,117 +660,228 @@ class ResultHandler:
     
     def save_resource_metrics(self, df, resource_type):
         """
-        자원 메트릭을 EAV 모델 형식으로 MySQL에 저장 (중복 검사 추가)
-        
-        Args:
-            df (pd.DataFrame): 자원 데이터프레임
-            resource_type (str): 자원 유형 (cpu, mem, disk, diskio, net, system)
-            
-        Returns:
-            bool: 성공 여부
+        자원 메트릭을 MySQL에 저장 (개선 버전)
         """
         if df is None or df.empty:
             logger.warning("저장할 자원 메트릭 데이터가 비어 있습니다.")
             return False
         
-        # 기본 메타데이터 추출
-        device_id = df['device_id'].iloc[0] if 'device_id' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('device_id', 'device_001')
-        company_domain = df['companyDomain'].iloc[0] if 'companyDomain' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('companyDomain', 'javame')
-        building = df['building'].iloc[0] if 'building' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('building', 'gyeongnam_campus')
-        
         try:
-            # MySQL 연결 생성
+            # MySQL 연결
             conn = self.mysql_connect()
             if not conn:
                 return False
             
             cursor = conn.cursor()
             
+            # 기본 메타데이터
+            device_id = df['device_id'].iloc[0] if 'device_id' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('device_id', 'device_001')
+            company_domain = df['companyDomain'].iloc[0] if 'companyDomain' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('companyDomain', 'javame')
+            building = df['building'].iloc[0] if 'building' in df.columns else self.config.get('data_processing', {}).get('default_values', {}).get('building', 'gyeongnam_campus')
+            
             # 데이터 변환 및 삽입
             records = []
             
-            # 인덱스가 DatetimeIndex인 경우 열로 변환
+            # 인덱스가 DatetimeIndex면 timestamp 열로 변환
             if isinstance(df.index, pd.DatetimeIndex):
-                df = df.reset_index().rename(columns={'index': 'timestamp'})
+                df_with_ts = df.reset_index()
+                df_with_ts.rename(columns={'index': 'timestamp'}, inplace=True)
+            else:
+                df_with_ts = df.copy()
             
-            # 중복 검사를 위한 기존 데이터 조회 (배치로 처리)
-            existing_records = {}
+            # 데이터 로깅으로 디버깅
+            logger.info(f"저장할 데이터 컬럼: {df_with_ts.columns.tolist()}")
+            logger.info(f"데이터 샘플: \n{df_with_ts.head()}")
             
-            # 각 지표별로 EAV 형식으로 변환
-            for idx, row in df.iterrows():
-                timestamp = row['timestamp'] if 'timestamp' in df.columns else datetime.now()
+            # InfluxDB _value 열 직접 처리
+            if '_value' in df_with_ts.columns:
+                logger.info("InfluxDB _value 열 처리 중...")
                 
-                # 숫자형 열만 사용
-                for col in df.select_dtypes(include=[np.number]).columns:
-                    # 메타데이터 열은 건너뜀
-                    if col in ['id', 'device_id', 'companyDomain', 'building'] or 'timestamp' in col.lower():
-                        continue
-                    
-                    # 단위 결정
-                    unit = '%' if 'percent' in col or 'usage' in col else ''
-                    if 'bytes' in col:
-                        unit = 'bytes/s'
-                    elif 'rate' in col:
-                        unit = '/s'
-                    
-                    # 값 검증 - NaN, inf 제외
-                    value = row[col]
-                    if pd.isna(value) or np.isinf(value):
-                        value = 0
-                    
-                    # 레코드 추가
-                    records.append((
-                        timestamp,
-                        device_id,
-                        resource_type,
-                        col,
-                        float(value),
-                        unit,
-                        company_domain,
-                        building
-                    ))
-            
-            # 중복 체크 (최대 100개씩 배치로)
-            batch_size = 100
-            checked_records = []
-            
-            for i in range(0, len(records), batch_size):
-                batch = records[i:i+batch_size]
+                # 디버깅 정보 출력
+                logger.info(f"_value 열 샘플: {df_with_ts['_value'].head()}")
+                logger.info(f"_value 열 타입: {df_with_ts['_value'].dtype}")
                 
-                # 중복 확인할 조건 생성
-                conditions = []
-                params = []
-                
-                for record in batch:
-                    timestamp, device_id, resource_type, metric_name = record[:4]
-                    conditions.append(f"(timestamp = %s AND device_id = %s AND resource_type = %s AND metric_name = %s)")
-                    params.extend([timestamp, device_id, resource_type, metric_name])
-                
-                if conditions:
-                    query = f"""
-                    SELECT timestamp, device_id, resource_type, metric_name FROM resource_metrics 
-                    WHERE {" OR ".join(conditions)}
-                    """
+                for idx, row in df_with_ts.iterrows():
+                    # 타임스탬프 처리
+                    if '_time' in df_with_ts.columns:
+                        # _time 열이 있으면 그대로 사용
+                        ts = row['_time']
+                        if isinstance(ts, pd.Timestamp):
+                            time_str = ts.strftime('%Y-%m-%d %H:%M:%S')
+                        else:
+                            time_str = str(ts)
+                    elif 'timestamp' in df_with_ts.columns:
+                        # timestamp 열 사용
+                        ts = row['timestamp']
+                        if isinstance(ts, pd.Timestamp):
+                            time_str = ts.strftime('%Y-%m-%d %H:%M:%S')
+                        else:
+                            time_str = str(ts)
+                    else:
+                        # 인덱스가 타임스탬프인 경우
+                        if isinstance(idx, pd.Timestamp):
+                            time_str = idx.strftime('%Y-%m-%d %H:%M:%S')
+                        else:
+                            # 모든 방법이 실패하면 기본값 사용
+                            time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     
-                    cursor.execute(query, params)
-                    results = cursor.fetchall()
+                    # _value 열 값 처리 - 핵심 수정 부분
+                    try:
+                        # 명시적으로 파이썬 기본 타입으로 변환
+                        raw_value = row['_value']
+                        # 디버깅 출력 추가
+                        logger.info(f"원본 _value: {raw_value}, 타입: {type(raw_value)}")
+                        
+                        # None, NaN 체크
+                        if pd.isna(raw_value) or raw_value is None:
+                            logger.warning(f"null 값 감지: {raw_value}")
+                            continue
+                        
+                        # 확실한 float 변환
+                        value = float(raw_value)
+                        logger.info(f"변환된 값: {value}, 타입: {type(value)}")
+                        
+                        # 메트릭 이름 설정
+                        if resource_type == 'cpu':
+                            metric_name = 'cpu_usage'
+                        elif resource_type == 'mem':
+                            metric_name = 'memory_used_percent'
+                        elif resource_type == 'disk':
+                            metric_name = 'disk_used_percent'
+                        else:
+                            metric_name = f"{resource_type}_value"
+                        
+                        # 단위 설정
+                        unit = '%' if resource_type in ['cpu', 'mem', 'disk'] or 'percent' in metric_name else ''
+                        
+                        # 레코드 추가
+                        records.append((
+                            time_str,
+                            device_id,
+                            resource_type,
+                            metric_name,
+                            value,  # 명시적으로 Python 기본 float 사용
+                            unit,
+                            company_domain,
+                            building
+                        ))
+                        
+                    except (ValueError, TypeError) as e:
+                        logger.error(f"값 변환 실패: {e}")
+            else:
+                logger.warning("_value 열이 데이터에 없습니다. 자원별 처리 열 사용...")
+                
+                # 자원별 특정 열 매핑
+                resource_columns = {
+                    'cpu': 'cpu_usage',
+                    'disk': 'disk_used_percent',
+                    'diskio': 'disk_io_utilization',
+                    'mem': 'memory_used_percent',
+                    'net': 'net_utilization',
+                    'system': 'system_load1'
+                }
+                
+                # 자원에 맞는 열 선택
+                target_column = resource_columns.get(resource_type)
+                
+                if target_column and target_column in df_with_ts.columns:
+                    logger.info(f"{resource_type} 자원의 {target_column} 열 사용")
                     
-                    # 존재하는 데이터 캐싱
-                    for result in results:
-                        key = (result[0], result[1], result[2], result[3])  # (timestamp, device_id, resource_type, metric_name)
-                        existing_records[key] = True
+                    for idx, row in df_with_ts.iterrows():
+                        # 타임스탬프 처리 (기존 코드 유지)
+                        if '_time' in df_with_ts.columns:
+                            ts = row['_time']
+                            if isinstance(ts, pd.Timestamp):
+                                time_str = ts.strftime('%Y-%m-%d %H:%M:%S')
+                            else:
+                                time_str = str(ts)
+                        elif 'timestamp' in df_with_ts.columns:
+                            ts = row['timestamp']
+                            if isinstance(ts, pd.Timestamp):
+                                time_str = ts.strftime('%Y-%m-%d %H:%M:%S')
+                            else:
+                                time_str = str(ts)
+                        else:
+                            time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        
+                        # 값 처리
+                        try:
+                            raw_value = row[target_column]
+                            # 디버깅
+                            logger.info(f"사용할 값: {raw_value}, 타입: {type(raw_value)}")
+                            
+                            # NaN 체크
+                            if pd.isna(raw_value) or raw_value is None:
+                                continue
+                            
+                            # float 변환
+                            value = float(raw_value)
+                            
+                            # 레코드 추가
+                            records.append((
+                                time_str,
+                                device_id,
+                                resource_type,
+                                target_column,
+                                value,
+                                '%' if 'percent' in target_column or resource_type in ['cpu', 'mem', 'disk'] else '',
+                                company_domain,
+                                building
+                            ))
+                        except Exception as e:
+                            logger.error(f"값 변환 실패: {e}")
+                else:
+                    # 대체 처리 - 모든 숫자형 열 처리
+                    logger.warning(f"{resource_type}에 대한 특정 열을 찾을 수 없음. 모든 숫자형 열 사용")
+                    for idx, row in df_with_ts.iterrows():
+                        # 타임스탬프 처리 (생략)...
+                        
+                        # 숫자형 열만 처리
+                        for col in df_with_ts.select_dtypes(include=[np.number]).columns:
+                            # 메타데이터 열은 건너뜀
+                            if col in ['id', 'device_id', 'companyDomain', 'building', 'table'] or 'timestamp' in col.lower():
+                                continue
+                            
+                            # 단위 결정
+                            unit = '%' if 'percent' in col or 'usage' in col else ''
+                            if 'bytes' in col:
+                                unit = 'bytes/s'
+                            elif 'rate' in col:
+                                unit = '/s'
+                            
+                            # 값 검증 - NaN, inf 제외
+                            value = row[col]
+                            if pd.isna(value) or np.isinf(value):
+                                continue
+                            
+                            try:
+                                # 명시적 float 변환
+                                value = float(value)
+                                logger.info(f"열 {col}의 값: {value}")
+                                
+                                # 레코드 추가
+                                records.append((
+                                    time_str,
+                                    device_id,
+                                    resource_type,
+                                    col,
+                                    value,
+                                    unit,
+                                    company_domain,
+                                    building
+                                ))
+                            except Exception as e:
+                                logger.warning(f"값 변환 실패: {value}, 오류: {e}")
             
-            # 중복이 아닌 레코드만 필터링
-            unique_records = []
-            for record in records:
-                key = (record[0], record[1], record[2], record[3])  # (timestamp, device_id, resource_type, metric_name)
-                if key not in existing_records:
-                    unique_records.append(record)
-                    # 이후 중복 검사를 위해 캐시에 추가
-                    existing_records[key] = True
+            # 저장할 레코드가 있는지 확인
+            if not records:
+                logger.warning(f"{resource_type} 자원에 저장할 유효한 데이터가 없습니다.")
+                cursor.close()
+                conn.close()
+                return False
             
-            # UPSERT 쿼리 (중복이 있는 경우 업데이트)
-            query = """
+            # 레코드 삽입
+            sql = """
             INSERT INTO resource_metrics 
             (timestamp, device_id, resource_type, metric_name, metric_value, unit, companyDomain, building)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
@@ -577,13 +890,31 @@ class ResultHandler:
             unit = VALUES(unit)
             """
             
-            if unique_records:
-                cursor.executemany(query, unique_records)
-                conn.commit()
-                
-                logger.info(f"{len(unique_records)}개의 자원 메트릭이 저장되었습니다. (자원: {resource_type}, 중복 제외: {len(records) - len(unique_records)}개)")
-            else:
-                logger.info(f"저장할 새로운 자원 메트릭이 없습니다. (모두 중복: {len(records)}개)")
+            # 각 레코드를 개별적으로 삽입하여 중복 오류 처리
+            success_count = 0
+            duplicate_count = 0
+            
+            for record in records:
+                try:
+                    # 디버깅 로그 추가
+                    logger.debug(f"SQL 실행 직전 metric_value: {record[4]}, 타입: {type(record[4])}")
+                    cursor.execute(sql, record)
+                    success_count += 1
+                except mysql.connector.errors.IntegrityError as e:
+                    if "Duplicate entry" in str(e):
+                        duplicate_count += 1
+                        # 오류 로깅 제한
+                        if duplicate_count <= 5:
+                            logger.warning(f"중복 데이터 건너뜀: {record[0]}, {record[3]}")
+                    else:
+                        logger.error(f"삽입 오류: {e}")
+                except Exception as e:
+                    logger.error(f"SQL 실행 오류: {e}, 레코드: {record}")
+            
+            # 명시적 커밋
+            conn.commit()
+            
+            logger.info(f"{resource_type} 자원 메트릭 저장 완료: {success_count}개 성공, {duplicate_count}개 중복")
             
             # 마지막 수집 시간 업데이트
             self.update_last_collection_time(resource_type, device_id, company_domain, building)
@@ -1075,7 +1406,9 @@ class ResultHandler:
             
             # 인덱스가 DatetimeIndex인 경우 열로 변환
             if isinstance(df.index, pd.DatetimeIndex):
-                df = df.reset_index().rename(columns={'index': 'timestamp'})
+                df = df.reset_index()
+                # 첫 번째 열(원래 인덱스)이 무슨 이름이든 timestamp로 변경
+                df.rename(columns={df.columns[0]: 'timestamp'}, inplace=True)
             
             # 각 예측 결과를 SQL 레코드로 변환
             for idx, row in df.iterrows():

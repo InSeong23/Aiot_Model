@@ -133,8 +133,19 @@ class Predictor:
                     steps = 1
             
             # 데이터 스케일링
-            pred_data, scaler = preprocessor.prepare_data_for_prediction(df, target_cols, scale=True)
-            
+            #pred_data, scaler = preprocessor.prepare_data_for_prediction(df, target_cols, scale=True)
+            # predictor.py의 predict_resource_usage 함수 내부
+            pred_data, scaler, quality_metrics = preprocessor.prepare_data_for_prediction(df, target_cols, scale=True)
+
+            # quality_metrics 정보 로깅 추가 (변수 사용)
+            if quality_metrics:
+                logger.info(f"데이터 품질 지표: 원본 행 수={quality_metrics.get('original_rows', 0)}, "
+                            f"결측률={quality_metrics.get('missing_ratio_after', 0):.4f}")
+                
+                # 품질 지표가 특정 임계값을 초과하면 경고
+                if quality_metrics.get('missing_ratio_after', 0) > 0.5:
+                    logger.warning(f"결측치 비율이 높습니다: {quality_metrics.get('missing_ratio_after', 0):.4f}")
+
             if pred_data.empty:
                 logger.error("데이터 준비 실패")
                 return pd.DataFrame()
@@ -560,6 +571,10 @@ class Predictor:
             from data_preprocessor import DataPreprocessor
             preprocessor = DataPreprocessor(self.config)
             
+            target_cols = self._get_target_columns(resource_type)
+            if not target_cols:
+                logger.error(f"{resource_type} 자원에 대한 타겟 열을 찾을 수 없습니다.")
+                return self._fallback_failure_prediction(df, resource_type)
             # 타겟 열 선택
             target_col = target_cols[0]  # 첫 번째 타겟 열만 사용
             
@@ -567,7 +582,17 @@ class Predictor:
             failure_threshold = self.config.get("prediction", {}).get("failure", {}).get("threshold", 10.0)
             
             # 데이터 스케일링
-            pred_data, scaler = preprocessor.prepare_data_for_prediction(df, [target_col], scale=True)
+            # predictor.py의 predict_resource_usage 함수 내부
+            pred_data, scaler, quality_metrics = preprocessor.prepare_data_for_prediction(df, target_cols, scale=True)
+
+            # quality_metrics 정보 로깅 추가 (변수 사용)
+            if quality_metrics:
+                logger.info(f"데이터 품질 지표: 원본 행 수={quality_metrics.get('original_rows', 0)}, "
+                            f"결측률={quality_metrics.get('missing_ratio_after', 0):.4f}")
+                
+                # 품질 지표가 특정 임계값을 초과하면 경고
+                if quality_metrics.get('missing_ratio_after', 0) > 0.5:
+                    logger.warning(f"결측치 비율이 높습니다: {quality_metrics.get('missing_ratio_after', 0):.4f}")
             
             if pred_data.empty:
                 logger.error("데이터 준비 실패")

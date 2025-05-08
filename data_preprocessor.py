@@ -53,70 +53,58 @@ class DataPreprocessor:
     
     def resample_data(self, df, freq=None):
         """
-        데이터 리샘플링 (기본 1시간 단위)
-        
-        Args:
-            df (pd.DataFrame): 데이터프레임
-            freq (str): 리샘플링 주기 (None일 경우 config에서 가져옴)
-            
-        Returns:
-            pd.DataFrame: 리샘플링된 데이터프레임
+        데이터 리샘플링 (전체 기간 생성, 결측치 유지)
         """
         if df is None or df.empty:
             logger.warning("리샘플링할 데이터가 비어 있습니다.")
             return df
         
-        # 설정에서 리샘플링 주기 가져오기 (기본값: 1시간)
+        # 설정에서 리샘플링 주기 가져오기
         if freq is None:
             freq = self.config.get('advanced', {}).get('resampling', {}).get('freq', '1h')
-            logger.info(f"리샘플링 주기: {freq}")
         
         if not isinstance(df.index, pd.DatetimeIndex):
             logger.warning("리샘플링을 위해서는 타임스탬프 인덱스가 필요합니다.")
-            # 인덱스가 타임스탬프가 아니면서 'timestamp' 또는 '_time' 열이 있는 경우 처리
+            # timestamp 열이 있으면 인덱스로 설정
             if 'timestamp' in df.columns:
-                logger.info("'timestamp' 열을 인덱스로 설정합니다.")
                 df = df.set_index('timestamp')
             elif '_time' in df.columns:
-                logger.info("'_time' 열을 인덱스로 설정합니다.")
                 df = df.set_index('_time')
             else:
-                logger.error("타임스탬프 열을 찾을 수 없습니다.")
                 return df
         
         # 숫자형 열 선택
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         
         try:
+            # 리샘플링 전 정보 로깅
+            logger.info(f"리샘플링 전 데이터 수: {len(df)}행")
+            
+            # 전체 기간 설정 - 하드코딩된 날짜 제거
+            start_date = df.index.min() - pd.Timedelta(hours=1)
+            end_date = df.index.max() + pd.Timedelta(hours=1)
+            
+            logger.info(f"리샘플링 기간: {start_date} ~ {end_date}")
+            
+            # 전체 기간에 대한 인덱스 생성
+            full_idx = pd.date_range(start=start_date, end=end_date, freq=freq, tz=df.index.tz)
+            
             # 리샘플링 (평균값 사용)
-            if len(numeric_cols) > 0:
-                resampled = df[numeric_cols].resample(freq).mean()
-            else:
-                logger.warning("숫자형 열이 없어 리샘플링을 수행할 수 없습니다.")
-                return df
+            resampled = df[numeric_cols].resample(freq).mean()
             
-            # 결측치 처리
-            resampled = resampled.interpolate(method='time').bfill().ffill()
+            # 전체 기간 인덱스와 합치기 (결측치 유지)
+            resampled = resampled.reindex(full_idx)
             
-            # 메타데이터 컬럼(location, origin, device_id 등) 복원
+            # 메타데이터 컬럼 복원
             for col in df.columns:
                 if col not in numeric_cols and col not in resampled.columns:
-                    try:
-                        # 모드(최빈값) 계산
-                        mode_series = df[col].mode()
-                        if not mode_series.empty:
-                            most_common = mode_series.iloc[0]
-                        else:
-                            # 최빈값이 없으면 첫 번째 비 NaN 값 사용
-                            non_nan_values = df[col].dropna()
-                            most_common = non_nan_values.iloc[0] if not non_nan_values.empty else None
-                        
-                        resampled[col] = most_common
-                    except Exception as e:
-                        logger.warning(f"'{col}' 열의 메타데이터 복원 실패: {e}")
-                        resampled[col] = None
+                    # 최빈값 사용
+                    mode_vals = df[col].mode()
+                    if not mode_vals.empty:
+                        resampled[col] = mode_vals.iloc[0]
             
-            logger.info(f"데이터 리샘플링 완료: {len(df)}행 -> {len(resampled)}행 (주기: {freq})")
+            logger.info(f"리샘플링 후 데이터 수: {len(resampled)}행 (주기: {freq})")
+            
             return resampled
             
         except Exception as e:
@@ -609,7 +597,7 @@ class DataPreprocessor:
     
     def prepare_data_for_prediction(self, df, target_cols=None, scale=True):
         """
-        예측을 위한 데이터 준비
+        예측을 위한 데이터 준비 (개선된 버전)
         
         Args:
             df (pd.DataFrame): 데이터프레임
@@ -619,12 +607,21 @@ class DataPreprocessor:
         Returns:
             pd.DataFrame: 예측을 위해 준비된 데이터프레임
             object: 스케일러 객체
+            dict: 데이터 품질 메트릭
         """
         if df is None or df.empty:
             logger.warning("준비할 데이터가 비어 있습니다.")
-            return pd.DataFrame(), None
+            return pd.DataFrame(), None, {"error": "empty_dataframe"}
         
         try:
+            # 원본 데이터 품질 지표 계산
+            quality_metrics = {
+                "original_rows": len(df),
+                "original_columns": len(df.columns),
+                "missing_ratio": df.isnull().mean().mean() if not df.empty else 0,
+                "timestamp_range": [df.index.min(), df.index.max()] if isinstance(df.index, pd.DatetimeIndex) else None
+            }
+            
             # 타겟 열이 지정되지 않은 경우 모든 숫자형 열 사용
             if target_cols is None:
                 target_cols = df.select_dtypes(include=[np.number]).columns.tolist()
@@ -634,43 +631,224 @@ class DataPreprocessor:
             
             if not valid_targets:
                 logger.warning(f"유효한 타겟 열이 없습니다: {target_cols}")
-                return pd.DataFrame(), None
+                return pd.DataFrame(), None, {"error": "no_valid_targets"}
             
-            # 필요한 열만 선택
-            pred_df = df[valid_targets].copy()
+            # 1. 리샘플링 (필요한 경우)
+            processed_df = df.copy()
+            if self.config.get('prediction', {}).get('resampling', {}).get('enabled', True):
+                freq = self.config.get('prediction', {}).get('resampling', {}).get('freq', '1h')
+                logger.info(f"예측을 위한 리샘플링 수행: {freq}")
+                
+                # 인덱스가 DatetimeIndex인지 확인
+                if isinstance(processed_df.index, pd.DatetimeIndex):
+                    # 리샘플링 전 정보 로깅
+                    logger.info(f"리샘플링 전 행 수: {len(processed_df)}")
+                    
+                    # 숫자형 열만 리샘플링 (평균값 사용)
+                    numeric_cols = processed_df.select_dtypes(include=[np.number]).columns
+                    resampled_df = processed_df[numeric_cols].resample(freq).mean()
+                    
+                    # 메타데이터 열 추가
+                    for col in processed_df.columns:
+                        if col not in numeric_cols and col not in resampled_df.columns:
+                            # 최빈값 사용
+                            resampled_df[col] = processed_df[col].mode().iloc[0] if not processed_df[col].mode().empty else None
+                    
+                    processed_df = resampled_df
+                    logger.info(f"리샘플링 후 행 수: {len(processed_df)}")
+                    
+                    # 품질 지표 업데이트
+                    quality_metrics["resampled_rows"] = len(processed_df)
+                else:
+                    logger.warning("리샘플링을 위해서는 타임스탬프 인덱스가 필요합니다.")
             
-            # 시간 관련 특성 추가 (인덱스가 DatetimeIndex인 경우)
-            if isinstance(df.index, pd.DatetimeIndex):
+            # 2. 결측치 처리
+            missing_strategy = self.config.get('prediction', {}).get('missing_data', {}).get('strategy', 'time')
+            missing_ratio_before = processed_df[valid_targets].isnull().mean().mean()
+            
+            if missing_ratio_before > 0:
+                logger.info(f"결측치 처리 전 결측률: {missing_ratio_before:.4f}")
+                
+                if missing_strategy == 'time':
+                    # 시간 기반 보간 (시계열 데이터에 적합)
+                    processed_df[valid_targets] = processed_df[valid_targets].interpolate(method='time')
+                    
+                    # 시작과 끝의 결측치 처리
+                    processed_df[valid_targets] = processed_df[valid_targets].ffill().bfill()
+                    
+                elif missing_strategy == 'linear':
+                    # 선형 보간법
+                    processed_df[valid_targets] = processed_df[valid_targets].interpolate(method='linear')
+                    processed_df[valid_targets] = processed_df[valid_targets].ffill().bfill()
+                    
+                elif missing_strategy == 'mean':
+                    # 평균값으로 대체
+                    for col in valid_targets:
+                        mean_val = processed_df[col].mean()
+                        processed_df[col] = processed_df[col].fillna(mean_val)
+                        
+                elif missing_strategy == 'median':
+                    # 중앙값으로 대체
+                    for col in valid_targets:
+                        median_val = processed_df[col].median()
+                        processed_df[col] = processed_df[col].fillna(median_val)
+                        
+                elif missing_strategy == 'ffill':
+                    # 이전 값으로 채우기
+                    processed_df[valid_targets] = processed_df[valid_targets].ffill()
+                    # 앞에 결측치가 있는 경우 뒤의 값으로 채우기
+                    processed_df[valid_targets] = processed_df[valid_targets].bfill()
+                    
+                elif missing_strategy == 'seasonal':
+                    # 계절성을 고려한 결측치 처리 (24시간 주기)
+                    for col in valid_targets:
+                        if isinstance(processed_df.index, pd.DatetimeIndex):
+                            # 시간대별 평균 계산
+                            hourly_means = processed_df.groupby(processed_df.index.hour)[col].mean()
+                            
+                            # 결측치를 시간대별 평균으로 대체
+                            for hour, mean_val in hourly_means.items():
+                                mask = (processed_df.index.hour == hour) & processed_df[col].isna()
+                                processed_df.loc[mask, col] = mean_val
+                    
+                    # 여전히 남아있는 결측치는 보간법으로 처리
+                    processed_df[valid_targets] = processed_df[valid_targets].interpolate(method='time')
+                    processed_df[valid_targets] = processed_df[valid_targets].ffill().bfill()
+                
+                # 결측치 처리 후 결측률 계산
+                missing_ratio_after = processed_df[valid_targets].isnull().mean().mean()
+                logger.info(f"결측치 처리 후 결측률: {missing_ratio_after:.4f}")
+                
+                # 품질 지표 업데이트
+                quality_metrics["missing_ratio_before"] = missing_ratio_before
+                quality_metrics["missing_ratio_after"] = missing_ratio_after
+                quality_metrics["missing_strategy"] = missing_strategy
+            
+            # 3. 이상치 처리
+            if self.config.get('prediction', {}).get('outliers', {}).get('handle_outliers', True):
+                outlier_method = self.config.get('prediction', {}).get('outliers', {}).get('method', 'iqr')
+                outlier_threshold = self.config.get('prediction', {}).get('outliers', {}).get('threshold', 1.5)
+                
+                outliers_count = 0
+                
+                for col in valid_targets:
+                    if outlier_method == 'zscore':
+                        # Z-점수 방식
+                        z_scores = np.abs((processed_df[col] - processed_df[col].mean()) / processed_df[col].std())
+                        outliers = (z_scores > outlier_threshold)
+                        
+                        if outliers.sum() > 0:
+                            # 이상치를 중앙값으로 대체
+                            median_val = processed_df[col].median()
+                            processed_df.loc[outliers, col] = median_val
+                            outliers_count += outliers.sum()
+                            
+                    elif outlier_method == 'iqr':
+                        # IQR 방식
+                        q1 = processed_df[col].quantile(0.25)
+                        q3 = processed_df[col].quantile(0.75)
+                        iqr = q3 - q1
+                        lower_bound = q1 - outlier_threshold * iqr
+                        upper_bound = q3 + outlier_threshold * iqr
+                        
+                        outliers = (processed_df[col] < lower_bound) | (processed_df[col] > upper_bound)
+                        
+                        if outliers.sum() > 0:
+                            # 이상치를 한계값으로 대체
+                            processed_df.loc[processed_df[col] < lower_bound, col] = lower_bound
+                            processed_df.loc[processed_df[col] > upper_bound, col] = upper_bound
+                            outliers_count += outliers.sum()
+                
+                if outliers_count > 0:
+                    logger.info(f"이상치 처리: {outliers_count}개 이상치 처리됨 (방식: {outlier_method}, 임계값: {outlier_threshold})")
+                    
+                # 품질 지표 업데이트
+                quality_metrics["outliers_count"] = outliers_count
+                quality_metrics["outlier_method"] = outlier_method
+            
+            # 4. 필요한 열만 선택
+            pred_df = processed_df[valid_targets].copy()
+            
+            # 5. 시간 관련 특성 추가 (인덱스가 DatetimeIndex인 경우)
+            if isinstance(processed_df.index, pd.DatetimeIndex):
                 # 시간 특성
-                pred_df['hour'] = df.index.hour
-                pred_df['dayofweek'] = df.index.dayofweek
-                pred_df['month'] = df.index.month
+                pred_df['hour'] = processed_df.index.hour
+                pred_df['dayofweek'] = processed_df.index.dayofweek
+                pred_df['month'] = processed_df.index.month
+                pred_df['day'] = processed_df.index.day
                 
                 # 주기성 표현 (sin/cos 변환)
-                pred_df['hour_sin'] = np.sin(2 * np.pi * df.index.hour / 24)
-                pred_df['hour_cos'] = np.cos(2 * np.pi * df.index.hour / 24)
-                pred_df['day_sin'] = np.sin(2 * np.pi * df.index.dayofweek / 7)
-                pred_df['day_cos'] = np.cos(2 * np.pi * df.index.dayofweek / 7)
+                pred_df['hour_sin'] = np.sin(2 * np.pi * processed_df.index.hour / 24)
+                pred_df['hour_cos'] = np.cos(2 * np.pi * processed_df.index.hour / 24)
+                pred_df['day_sin'] = np.sin(2 * np.pi * processed_df.index.dayofweek / 7)
+                pred_df['day_cos'] = np.cos(2 * np.pi * processed_df.index.dayofweek / 7)
+                pred_df['month_sin'] = np.sin(2 * np.pi * processed_df.index.month / 12)
+                pred_df['month_cos'] = np.cos(2 * np.pi * processed_df.index.month / 12)
                 
                 # 주말, 업무 시간 플래그
-                pred_df['is_weekend'] = df.index.dayofweek.isin([5, 6]).astype(int)
-                pred_df['is_business_hour'] = ((df.index.hour >= 9) & (df.index.hour < 18) & 
-                                              ~df.index.dayofweek.isin([5, 6])).astype(int)
+                pred_df['is_weekend'] = processed_df.index.dayofweek.isin([5, 6]).astype(int)
+                pred_df['is_business_hour'] = ((processed_df.index.hour >= 9) & 
+                                            (processed_df.index.hour < 18) & 
+                                            ~processed_df.index.dayofweek.isin([5, 6])).astype(int)
+                
+                # 품질 지표 업데이트
+                quality_metrics["time_features_added"] = True
             
-            # 스케일링
+            # 6. 추가 특성 (지연된 특성, 이동 평균 등)
+            lag_features = self.config.get('prediction', {}).get('features', {}).get('lag_features', False)
+            if lag_features:
+                # 지연된 특성 추가 (1일, 7일 이전 값)
+                for col in valid_targets:
+                    # 1일 전 값
+                    if isinstance(processed_df.index, pd.DatetimeIndex):
+                        pred_df[f'{col}_lag_24h'] = processed_df[col].shift(24)  # 24시간 (1일) 지연
+                        
+                        # 7일 전 값 (주간 패턴)
+                        pred_df[f'{col}_lag_7d'] = processed_df[col].shift(24*7)  # 7일 지연
+            
+            rolling_features = self.config.get('prediction', {}).get('features', {}).get('rolling_features', False)
+            if rolling_features:
+                # 이동 평균/표준편차 추가
+                for col in valid_targets:
+                    # 24시간 이동 평균
+                    pred_df[f'{col}_rolling_mean_24h'] = processed_df[col].rolling(window=24).mean()
+                    
+                    # 24시간 이동 표준편차
+                    pred_df[f'{col}_rolling_std_24h'] = processed_df[col].rolling(window=24).std()
+            
+            # 결측치 최종 처리 (특성 추가 후 발생한 결측치)
+            pred_df = pred_df.fillna(method='ffill').fillna(method='bfill')
+            
+            # 7. 스케일링
+            scaler = None
             if scale:
-                scaler = MinMaxScaler(feature_range=(0, 1))
-                scaled_data = scaler.fit_transform(pred_df)
-                pred_df = pd.DataFrame(scaled_data, index=pred_df.index, columns=pred_df.columns)
-                return pred_df, scaler
+                # NaN 값이 있는지 확인
+                if pred_df.isnull().values.any():
+                    logger.warning("스케일링 전 결측치가 발견되었습니다. 결측치를 0으로 대체합니다.")
+                    pred_df = pred_df.fillna(0)
+                    
+                try:
+                    scaler = MinMaxScaler(feature_range=(0, 1))
+                    scaled_data = scaler.fit_transform(pred_df)
+                    scaled_df = pd.DataFrame(scaled_data, index=pred_df.index, columns=pred_df.columns)
+                    
+                    # 품질 지표 업데이트
+                    quality_metrics["scaling"] = "MinMaxScaler"
+                    
+                    logger.info(f"데이터 스케일링 완료 (0-1 범위)")
+                    return scaled_df, scaler, quality_metrics
+                except Exception as e:
+                    logger.error(f"스케일링 중 오류 발생: {e}")
+                    # 스케일링 실패 시 원본 반환
+                    return pred_df, None, quality_metrics
             
-            return pred_df, None
+            return pred_df, None, quality_metrics
             
         except Exception as e:
             logger.error(f"예측 데이터 준비 중 오류 발생: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            return pd.DataFrame(), None
+            return pd.DataFrame(), None, {"error": str(e)}
     
     def create_sequence_dataset(self, df, target_cols, input_window=24, pred_horizon=1):
         """

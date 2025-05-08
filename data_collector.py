@@ -142,7 +142,6 @@ class DataCollector:
             from(bucket: "{bucket}")
             |> range(start: {start_time_str}, stop: {end_time_str})
             |> filter(fn: (r) => {filter_str})
-            |> limit(n: 2000)
             '''
             
             # 쿼리 실행
@@ -333,50 +332,22 @@ class DataCollector:
         return all_processed_data
     
     def get_resource_data(self, resource_type, start_time=None, end_time=None, tags=None):
-        """
-        리소스 유형별 데이터 수집 (개선)
-        
-        Args:
-            resource_type (str): 자원 유형
-            start_time (datetime): 시작 시간 (None이면 마지막 수집 시간 또는 7일 전부터)
-            end_time (datetime): 종료 시간 (None이면 현재 시간)
-            tags (dict): 태그 필터
-            
-        Returns:
-            pd.DataFrame: 자원 데이터
-        """
-        if end_time is None:
-            end_time = datetime.now()
-        
+        # start_time이 None이면 직접 기간 설정
         if start_time is None:
-            # 초기 데이터 수집 시 7일 기본값 사용
-            max_days = self.config.get("data_collection", {}).get("max_days_initial", 7)
+            # 더 긴 기간으로 설정 (10일)
+            max_days = 10
             start_time = end_time - timedelta(days=max_days)
-            logger.info(f"{resource_type} 자원의 초기 데이터 수집: {max_days}일 기간")
+            logger.info(f"{resource_type} 초기 데이터 수집: {max_days}일 기간 ({start_time} ~ {end_time})")
         
-        # 간소화된 쿼리: 단일 필터 (location만)
-        logger.info(f"{resource_type} 데이터 수집 중... (기간: {start_time} ~ {end_time})")
-        df = self.query_data(
-            start_time=start_time,
-            end_time=end_time,
-            location=resource_type
-        )
+        # 로그 추가
+        logger.info(f"{resource_type} 데이터 수집 범위: {start_time} ~ {end_time}")
         
-        if df is None or df.empty:
-            logger.warning(f"{resource_type} 데이터 수집 실패")
-            return pd.DataFrame()
+        # 데이터 쿼리 (limit 제거)
+        df = self.query_data(start_time=start_time, end_time=end_time, location=resource_type)
         
-        # 기본 메타데이터 추가
-        if 'device_id' not in df.columns or df['device_id'].isna().all():
-            df['device_id'] = self.config.get('data_processing', {}).get('default_values', {}).get('device_id', '192.168.71.74')
-        
-        if 'companyDomain' not in df.columns or df['companyDomain'].isna().all():
-            df['companyDomain'] = self.config.get('data_processing', {}).get('default_values', {}).get('companyDomain', 'javame')
-        
-        if 'building' not in df.columns or df['building'].isna().all():
-            df['building'] = self.config.get('data_processing', {}).get('default_values', {}).get('building', 'gyeongnam_campus')
-        
-        logger.info(f"{resource_type} 데이터 수집 완료: {len(df)}행")
+        # 결과 로그 추가 
+        if df is not None and not df.empty:
+            logger.info(f"수집된 데이터: {len(df)}행, 기간: {df.index.min()} ~ {df.index.max()}")
         return df
     
     def load_processed_data(self, days=7, resource_types=None):

@@ -141,10 +141,10 @@
   "advanced": {
     "resampling": {
       "enabled": true,
-      "freq": "1H"
+      "freq": "1h"
     },
     "missing_data": {
-      "handle_missing": true,
+      "handle_missing": false,
       "max_missing_ratio": 0.8,
       "fill_method": "ffill"
     },
@@ -160,7 +160,7 @@
     "use_eav_model": true,
     "batch_size": 1000,
     "partition_strategy": {
-      "enabled": true,
+      "enabled": false,
       "interval": "month",
       "retention_months": 12
     },
@@ -197,7 +197,7 @@
     }
   ],
   "data_collection": {
-    "max_days_initial": 7,
+    "max_days_initial": 10,
     "incremental": true
   }
 }
